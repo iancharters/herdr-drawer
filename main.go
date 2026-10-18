@@ -288,6 +288,32 @@ func withStateLock(fn func(*StateFile) error) error {
 	return os.Rename(tmpPath, statePath)
 }
 
+func readStateSnapshot() (*StateFile, error) {
+	dir := stateDir()
+	lockFile, err := os.OpenFile(filepath.Join(dir, "state.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+
+	statePath := filepath.Join(dir, "state.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		return nil, err
+	}
+	sf := &StateFile{Tabs: map[string]*TabDrawerState{}}
+	if err := json.Unmarshal(data, sf); err != nil {
+		return nil, err
+	}
+	return sf, nil
+}
+
 func sanitizePaneID(paneID string) string {
 	return strings.ReplaceAll(paneID, ":", "_")
 }
@@ -620,6 +646,7 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 	for _, p := range panes {
 		activeTabs[p.TabID] = true
 	}
+	referencedSessions := map[string]bool{}
 	for tabID, ts := range sf.Tabs {
 		anchorPane, anchorAlive := termToPane[ts.AnchorTerminalID]
 		if !activeTabs[tabID] || (ts.AnchorTerminalID != "" && (!anchorAlive || anchorPane.TabID != tabID)) {
@@ -637,6 +664,38 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 				killSession(sessID)
 			}
 			delete(sf.Tabs, tabID)
+			continue
+		}
+
+		if ts.Visible {
+			for termID, sessID := range ts.TermToSession {
+				if p, ok := termToPane[termID]; !ok || p.TabID != tabID {
+					if sessID != "" {
+						killSession(sessID)
+					}
+					delete(ts.TermToSession, termID)
+				}
+			}
+		}
+
+		collectDrawerSessions(ts.Tree, referencedSessions)
+		for _, sessID := range ts.TermToSession {
+			if sessID != "" {
+				referencedSessions[sessID] = true
+			}
+		}
+	}
+
+	if entries, err := os.ReadDir(sessionsDir()); err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".sock") {
+				continue
+			}
+			sessID := strings.TrimSuffix(name, ".sock")
+			if !referencedSessions[sessID] {
+				killSession(sessID)
+			}
 		}
 	}
 }
@@ -649,6 +708,19 @@ func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, dra
 
 	knownSessions := map[string]bool{}
 	collectDrawerSessions(tree, knownSessions)
+
+	prevSessions := map[string]bool{}
+	collectDrawerSessions(ts.Tree, prevSessions)
+	for _, sessID := range ts.TermToSession {
+		if sessID != "" {
+			prevSessions[sessID] = true
+		}
+	}
+	for sessID := range prevSessions {
+		if !knownSessions[sessID] {
+			killSession(sessID)
+		}
+	}
 
 	ts.DrawerRatio = drawerSplit.Ratio
 	ts.Tree = tree

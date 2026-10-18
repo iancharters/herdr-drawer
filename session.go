@@ -311,13 +311,74 @@ func runHost(sessionID, cwd string, initRows, initCols uint16) error {
 		}
 	}
 
+	terminateShell := func() {
+		if cmd.Process == nil {
+			return
+		}
+		pgid := cmd.Process.Pid
+		_ = syscall.Kill(-pgid, syscall.SIGHUP)
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}()
+		_ = ln.Close()
+	}
+
+	disconnectCh := make(chan struct{}, 1)
+	notifyDisconnect := func() {
+		select {
+		case disconnectCh <- struct{}{}:
+		default:
+		}
+	}
+
+	doneCh := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
+		close(doneCh)
 		_ = ln.Close()
 		_ = os.Remove(sock)
 		setActiveConn(nil)
 		_ = master.Close()
 	}()
+
+	if os.Getenv("HERDR_DRAWER_NO_WATCHDOG") == "" {
+		go func() {
+			// Allow initial showDrawer/split state.json write to complete.
+			select {
+			case <- time.After(2 * time.Second):
+			case <-doneCh:
+				return
+			}
+
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-doneCh:
+					return
+				case <-disconnectCh:
+					select {
+					case <-time.After(350 * time.Millisecond):
+					case <-doneCh:
+						return
+					}
+				case <-ticker.C:
+				}
+
+				clientMu.Lock()
+				attached := activeConn != nil
+				clientMu.Unlock()
+
+				if !shouldKeepSessionAlive(sessionID, attached) {
+					terminateShell()
+					return
+				}
+			}
+		}()
+	}
 
 	go func() {
 		buf := make([]byte, 4096)
@@ -381,13 +442,9 @@ func runHost(sessionID, cwd string, initRows, initCols uint16) error {
 				_ = c.Close()
 				return
 			case "kill":
-				if cmd.Process != nil {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-				}
 				_, _ = c.Write([]byte(`{"ok":true}` + "\n"))
 				_ = c.Close()
-				_ = ln.Close()
+				terminateShell()
 				return
 			case "attach":
 				if hs.Rows > 0 && hs.Cols > 0 {
@@ -438,17 +495,79 @@ func runHost(sessionID, cwd string, initRows, initCols uint16) error {
 					}
 				}
 			done:
+				wasActive := false
 				clientMu.Lock()
 				if activeConn == c {
 					activeConn = nil
+					wasActive = true
 				}
 				clientMu.Unlock()
 				_ = c.Close()
+				if wasActive {
+					notifyDisconnect()
+				}
 			default:
 				_ = c.Close()
 			}
 		}(conn)
 	}
+}
+
+func shouldKeepSessionAlive(sessionID string, attached bool) bool {
+	sockPath, err := resolveSocketPath()
+	if err != nil {
+		return false
+	}
+	client := &RPCClient{socketPath: sockPath}
+	panes, err := client.ListPanes()
+	if err != nil {
+		return false
+	}
+	if attached {
+		return true
+	}
+
+	sf, err := readStateSnapshot()
+	if err != nil || sf == nil {
+		return false
+	}
+
+	activeTabs := make(map[string]bool, len(panes))
+	termToTab := make(map[string]string, len(panes))
+	for _, p := range panes {
+		activeTabs[p.TabID] = true
+		termToTab[p.TerminalID] = p.TabID
+	}
+
+	for tabID, ts := range sf.Tabs {
+		sessions := map[string]bool{}
+		collectDrawerSessions(ts.Tree, sessions)
+		for _, s := range ts.TermToSession {
+			if s != "" {
+				sessions[s] = true
+			}
+		}
+		if !sessions[sessionID] {
+			continue
+		}
+		if !activeTabs[tabID] {
+			return false
+		}
+		if ts.AnchorTerminalID != "" && termToTab[ts.AnchorTerminalID] != tabID {
+			return false
+		}
+		if ts.Visible {
+			for termID, s := range ts.TermToSession {
+				if s == sessionID && termToTab[termID] == tabID {
+					return true
+				}
+			}
+			return false
+		}
+		return true
+	}
+
+	return false
 }
 
 func runAttach(sessionID, cwd string) error {
