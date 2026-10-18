@@ -235,13 +235,20 @@ type MoveResult struct {
 	CreatedWorkspace *WorkspaceInfo `json:"created_workspace,omitempty"`
 }
 
-func (c *RPCClient) MovePaneToStash(paneID, stashWorkspaceID string) (*MoveResult, error) {
+func (c *RPCClient) MovePaneToStash(paneID, stashWorkspaceID, stashTabID string) (*MoveResult, error) {
 	var dest map[string]interface{}
 	if stashWorkspaceID == "" {
 		dest = map[string]interface{}{
 			"type":      "new_workspace",
 			"label":     stashWorkspaceLabel,
 			"tab_label": stashTabLabel,
+		}
+	} else if stashTabID != "" {
+		dest = map[string]interface{}{
+			"type":    "tab",
+			"tab_id":  stashTabID,
+			"split":   "down",
+			"ratio":   0.5,
 		}
 	} else {
 		dest = map[string]interface{}{
@@ -262,6 +269,10 @@ func (c *RPCClient) MovePaneToStash(paneID, stashWorkspaceID string) (*MoveResul
 		return nil, err
 	}
 	return &res.MoveResult, nil
+}
+
+func (c *RPCClient) ClosePane(paneID string) error {
+	return c.Call("pane.close", map[string]interface{}{"pane_id": paneID}, nil)
 }
 
 func (c *RPCClient) MovePaneToTabSplit(paneID, tabID, targetPaneID, splitDir string, ratio float64, focus bool) (*MoveResult, error) {
@@ -588,13 +599,31 @@ func findTargetPane(panes []PaneInfo, explicitPaneID string) (*PaneInfo, error) 
 	return nil, errors.New("no active pane found")
 }
 
-func findStashWorkspaceID(workspaces []WorkspaceInfo) string {
+func findStashWorkspace(workspaces []WorkspaceInfo) (string, string) {
 	for _, ws := range workspaces {
 		if ws.Label == stashWorkspaceLabel {
-			return ws.WorkspaceID
+			return ws.WorkspaceID, ws.ActiveTabID
 		}
 	}
-	return ""
+	return "", ""
+}
+
+func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termToPane map[string]PaneInfo) {
+	activeTabs := make(map[string]bool, len(panes))
+	for _, p := range panes {
+		activeTabs[p.TabID] = true
+	}
+	for tabID, ts := range sf.Tabs {
+		anchorPane, anchorAlive := termToPane[ts.AnchorTerminalID]
+		if !activeTabs[tabID] || (ts.AnchorTerminalID != "" && (!anchorAlive || anchorPane.TabID != tabID)) {
+			for termID := range ts.KnownTerminals {
+				if p, ok := termToPane[termID]; ok {
+					_ = client.ClosePane(p.PaneID)
+				}
+			}
+			delete(sf.Tabs, tabID)
+		}
+	}
 }
 
 func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, drawerSplit *LayoutNode, currentPane *PaneInfo, paneByID map[string]PaneInfo, paneToTerm map[string]string, termToPane map[string]PaneInfo) error {
@@ -625,7 +654,7 @@ func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, dra
 	if err != nil {
 		return err
 	}
-	stashWsID := findStashWorkspaceID(workspaces)
+	stashWsID, stashTabID := findStashWorkspace(workspaces)
 
 	leaves := collectDrawerLeavesOrdered(tree)
 	for _, termID := range leaves {
@@ -633,12 +662,16 @@ func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, dra
 		if !ok {
 			continue
 		}
-		res, err := client.MovePaneToStash(p.PaneID, stashWsID)
+		res, err := client.MovePaneToStash(p.PaneID, stashWsID, stashTabID)
 		if err != nil {
 			return err
 		}
 		if stashWsID == "" && res.CreatedWorkspace != nil {
 			stashWsID = res.CreatedWorkspace.WorkspaceID
+			stashTabID = res.CreatedWorkspace.ActiveTabID
+		}
+		if stashTabID == "" && res.Pane.TabID != "" {
+			stashTabID = res.Pane.TabID
 		}
 	}
 
@@ -763,6 +796,8 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
 			paneToTerm[p.PaneID] = p.TerminalID
 			termToPane[p.TerminalID] = p
 		}
+
+		gcOrphanedDrawers(client, sf, panes, termToPane)
 
 		currentPane, err := findTargetPane(panes, explicitPaneID)
 		if err != nil {
