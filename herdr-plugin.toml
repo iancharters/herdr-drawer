@@ -34,3 +34,12 @@ id = "split-down"
 title = "Split drawer pane down"
 contexts = ["global"]
 command = ["bash", "drawer.sh", "split", "--direction", "down"]
+
+[[panes]]
+id = "drawer"
+title = "Drawer"
+description = "Persistent bottom terminal drawer pane"
+platforms = ["linux", "macos"]
+placement = "split"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/drawer.sh\" attach"]
+

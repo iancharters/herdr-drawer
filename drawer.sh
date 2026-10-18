@@ -4,7 +4,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$DIR/bin/herdr-drawer"
 
-if [ ! -x "$BIN" ] || [ "$DIR/main.go" -nt "$BIN" ]; then
+if [ ! -x "$BIN" ] || [ "$DIR/main.go" -nt "$BIN" ] || [ "$DIR/session.go" -nt "$BIN" ]; then
   mkdir -p "$DIR/bin"
   GO_BIN="${GO_BIN:-}"
   if [ -z "$GO_BIN" ]; then

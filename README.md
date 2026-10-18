@@ -63,7 +63,7 @@ Split panes inside the drawer using either standard `herdr` split keybindings or
 ```
 
 ### 4. Press `Ctrl+/` Again (from Neovim or the Drawer) -> Drawer Hides
-Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the drawer's binary split tree (`Split(right, 0.5, term_A, term_B)` + drawer height ratio) and moves the live drawer panes into a background `__drawer_stash__` workspace. `Neovim` reclaims its full height while `Agent` (`w1:p2`) stays visible. Pressing `Ctrl+/` again restores `term_A` and `term_B` in the exact same split arrangement.
+Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the drawer's binary split tree (`Split(right, 0.5, sess_A, sess_B)` + drawer height ratio) and closes the drawer panes in `herdr` while keeping their underlying shells alive in detached background PTY session hosts (`herdr-drawer host`). `Neovim` reclaims its full height, `Agent` (`w1:p2`) stays visible, and **no extra workspace or tab ever appears in `herdr`'s workspace or tab bars**. Pressing `Ctrl+/` again recreates the split tree via `plugin.pane.open` and re-attaches each pane to its persistent PTY session with full screen replay.
 
 ---
 
@@ -78,17 +78,17 @@ flowchart TD
     IsVisible -->|"Yes (from Neovim OR Drawer)"| HideFlow["Hide Drawer"]
     IsVisible -->|"No (Hidden or Not Created)"| ShowFlow["Show / Restore Drawer"]
 
-    subgraph hideSubgraph ["Hide Drawer (Without Zoom)"]
-        HideFlow --> SnapshotTree["Snapshot drawer binary split tree D (terminal_ids, directions, ratios) & drawer height ratio"]
-        SnapshotTree --> StashPanes["Move each leaf pane in D to background __drawer_stash__ workspace (focus=false)"]
-        StashPanes --> FocusEditor["Focus anchor pane (Neovim)"]
+    subgraph hideSubgraph ["Hide Drawer (Zero Extra Workspaces)"]
+        HideFlow --> SnapshotTree["Snapshot drawer binary split tree D (session_ids, directions, ratios) & drawer height ratio"]
+        SnapshotTree --> FocusEditor["Focus anchor pane (Neovim)"]
+        FocusEditor --> ClosePanes["Close drawer panes in herdr via pane.close (detached PTY session hosts stay alive)"]
     end
 
     subgraph showSubgraph ["Show / Restore Drawer"]
-        ShowFlow --> HasAlivePanes{"Are stashed drawer terminals alive?"}
+        ShowFlow --> HasAlivePanes{"Are detached PTY sessions alive?"}
         HasAlivePanes -->|"No (First Open)"| ResolveCwd["Resolve Neovim cwd (synced getcwd() or pane.process_info)"]
-        ResolveCwd --> SplitDown["Split anchor pane down (ratio 0.70) in cwd & focus drawer"]
-        HasAlivePanes -->|"Yes (Restore Arrangement)"| PreOrder["Pre-order traverse saved tree D: pane.move leaves back under anchor & sibling leaves with saved directions/ratios"]
+        ResolveCwd --> SplitDown["Open plugin split pane down (ratio 0.70) attached to new PTY session"]
+        HasAlivePanes -->|"Yes (Restore Arrangement)"| PreOrder["Pre-order traverse saved tree D: plugin.pane.open & layout.set_split_ratio to re-attach live PTY sessions"]
         PreOrder --> RestoreFocus["Focus last active drawer pane"]
     end
 ```
@@ -104,8 +104,8 @@ flowchart TD
     EditorPane["Pane: Neovim (w1:p1)"]
     AgentPane["Pane: Agent (w1:p2)"]
     InnerSplit["Split (direction: right, ratio: 0.50)"]
-    Drawer1["Pane: Drawer 1 (term_A)"]
-    Drawer2["Pane: Drawer 2 (term_B)"]
+    Drawer1["Pane: Drawer 1 (sess_A)"]
+    Drawer2["Pane: Drawer 2 (sess_B)"]
 
     TabRoot -->|"first"| DrawerSplit
     TabRoot -->|"second"| AgentPane
@@ -115,8 +115,8 @@ flowchart TD
     InnerSplit -->|"second"| Drawer2
 ```
 
-- **Hiding**: `herdr-drawer` exports `DrawerSplit.second` as a tree of immutable `terminal_id`s (`term_A`, `term_B`) along with each split's `direction` and `ratio`, then moves each leaf pane to `__drawer_stash__`. Removing those leaves collapses `DrawerSplit` back into `EditorPane` (`w1:p1`) without touching `AgentPane` (`w1:p2`).
-- **Unhiding**: Because `pane.move` into a tab replaces a target leaf `L` with `Split(direction, ratio, L, moved_pane)`, traversing the saved binary tree `D` in **pre-order** reconstructs any arbitrary combination of nested horizontal and vertical splits with their exact ratios.
+- **Hiding**: `herdr-drawer` exports `DrawerSplit.second` as a tree of persistent `session_id`s (`sess_A`, `sess_B`) along with each split's `direction` and `ratio`, then closes the drawer panes in `herdr`. Removing those leaves collapses `DrawerSplit` back into `EditorPane` (`w1:p1`) without touching `AgentPane` (`w1:p2`) and without creating any stash workspace in `herdr`'s sidebar.
+- **Unhiding**: Traversing the saved binary tree `D` in **pre-order** via `plugin.pane.open` and `layout.set_split_ratio` reconstructs any arbitrary combination of nested horizontal and vertical splits with their exact ratios and re-attaches each pane (`herdr-drawer attach`) to its background PTY host (`herdr-drawer host`), replaying the ring buffer so output and running processes are preserved seamlessly.
 
 ---
 
