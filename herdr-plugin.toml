@@ -1,0 +1,36 @@
+id = "herdr-drawer"
+name = "Herdr Terminal Drawer"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "VS Code-style persistent, multi-pane bottom terminal drawer scoped to each herdr tab"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle terminal drawer"
+contexts = ["global"]
+command = ["bash", "drawer.sh", "toggle"]
+
+[[actions]]
+id = "open"
+title = "Open terminal drawer"
+contexts = ["global"]
+command = ["bash", "drawer.sh", "open"]
+
+[[actions]]
+id = "close"
+title = "Close terminal drawer"
+contexts = ["global"]
+command = ["bash", "drawer.sh", "close"]
+
+[[actions]]
+id = "split-right"
+title = "Split drawer pane right"
+contexts = ["global"]
+command = ["bash", "drawer.sh", "split", "--direction", "right"]
+
+[[actions]]
+id = "split-down"
+title = "Split drawer pane down"
+contexts = ["global"]
+command = ["bash", "drawer.sh", "split", "--direction", "down"]
