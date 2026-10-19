@@ -1,22 +1,12 @@
--- herdr-drawer.lua — Neovim integration for herdr-drawer
---
--- Copy this file into your Neovim config:
---   cp example/herdr-drawer.lua ~/.config/nvim/plugin/herdr-drawer.lua
--- or source it from your config (e.g. init.lua or lua/config/keymaps.lua):
---   dofile(vim.fn.expand("~/dev/herdr-plugins/herdr-drawer/example/herdr-drawer.lua"))
---
--- What this file does:
--- 1. Automatically syncs Neovim's current working directory (`vim.fn.getcwd()`)
---    for `$HERDR_PANE_ID` so that when `herdr` intercepts `Ctrl+/` at the
---    multiplexer level, the drawer always opens in Neovim's active directory
---    (including after `:cd`, `:lcd`, or `:tcd`).
--- 2. Registers `:HerdrDrawerToggle`, `:HerdrDrawerOpen`, `:HerdrDrawerClose`,
---    `:HerdrDrawerSplitRight`, and `:HerdrDrawerSplitDown` commands, plus
---    `<C-/>` / `<C-_>` fallback keymaps.
+if vim.g.loaded_herdr_drawer then
+  return {}
+end
 
 if not vim.env.HERDR_PANE_ID or vim.env.HERDR_PANE_ID == "" then
-  return
+  return {}
 end
+
+vim.g.loaded_herdr_drawer = 1
 
 local uv = vim.uv or vim.loop
 
@@ -27,7 +17,10 @@ local function get_uid()
   return tonumber(vim.fn.system("id -u")) or 0
 end
 
-local state_dir = string.format("/tmp/herdr-drawer-%d", get_uid())
+local state_dir = vim.env.HERDR_DRAWER_STATE_DIR
+if not state_dir or state_dir == "" then
+  state_dir = string.format("/tmp/herdr-drawer-%d", get_uid())
+end
 local cwd_dir = state_dir .. "/cwd"
 local sanitized_pane_id = (vim.env.HERDR_PANE_ID or ""):gsub(":", "_")
 
@@ -37,8 +30,7 @@ local function sync_nvim_cwd()
     return
   end
   vim.fn.mkdir(cwd_dir, "p", "0700")
-  local path = cwd_dir .. "/" .. sanitized_pane_id
-  local f = io.open(path, "w")
+  local f = io.open(cwd_dir .. "/" .. sanitized_pane_id, "w")
   if f then
     f:write(cwd)
     f:close()
@@ -52,32 +44,52 @@ vim.api.nvim_create_autocmd({ "VimEnter", "DirChanged", "BufEnter", "WinEnter" }
 })
 sync_nvim_cwd()
 
-local cached_runner = nil
-local function resolve_drawer_runner()
+local script_source = debug.getinfo(1, "S").source
+local self_plugin_root = nil
+if type(script_source) == "string" and script_source:sub(1, 1) == "@" then
+  self_plugin_root = vim.fn.fnamemodify(script_source:sub(2), ":p:h:h")
+end
+
+local cached_bin = nil
+local function resolve_drawer_bin()
   if vim.g.herdr_drawer_bin and vim.g.herdr_drawer_bin ~= "" then
     return vim.g.herdr_drawer_bin
   end
-  if cached_runner then
-    return cached_runner
+  if cached_bin and vim.fn.executable(cached_bin) == 1 then
+    return cached_bin
   end
 
-  local plugins_json = vim.fn.expand("~/.config/herdr/plugins.json")
+  if self_plugin_root then
+    local candidate = self_plugin_root .. "/bin/herdr-drawer"
+    if vim.fn.executable(candidate) == 1 then
+      cached_bin = candidate
+      return cached_bin
+    end
+  end
+
+  local config_dir = vim.env.XDG_CONFIG_HOME
+  if not config_dir or config_dir == "" then
+    config_dir = vim.fn.expand("~/.config")
+  end
+  local plugins_json = config_dir .. "/herdr/plugins.json"
   if vim.fn.filereadable(plugins_json) == 1 then
-    local ok, content = pcall(vim.fn.readfile, plugins_json)
-    if ok and content then
-      local decoded_ok, plugins = pcall(vim.json.decode, table.concat(content, "\n"))
+    local ok, lines = pcall(vim.fn.readfile, plugins_json)
+    if ok and lines then
+      local decoded_ok, plugins = pcall(vim.json.decode, table.concat(lines, "\n"))
       if decoded_ok and type(plugins) == "table" then
         for _, p in ipairs(plugins) do
-          if type(p) == "table" and p.plugin_root and (p.plugin_id == "herdr-drawer" or (type(p.plugin_id) == "string" and p.plugin_id:match("%.herdr%-drawer$"))) then
+          if
+            type(p) == "table"
+            and p.plugin_root
+            and (
+              p.plugin_id == "herdr-drawer"
+              or (type(p.plugin_id) == "string" and p.plugin_id:match("%.herdr%-drawer$"))
+            )
+          then
             local bin = p.plugin_root .. "/bin/herdr-drawer"
             if vim.fn.executable(bin) == 1 then
-              cached_runner = bin
-              return cached_runner
-            end
-            local script = p.plugin_root .. "/drawer.sh"
-            if vim.fn.filereadable(script) == 1 then
-              cached_runner = script
-              return cached_runner
+              cached_bin = bin
+              return cached_bin
             end
           end
         end
@@ -85,16 +97,18 @@ local function resolve_drawer_runner()
     end
   end
 
-  local fallback = vim.fn.expand("~/dev/herdr-plugins/herdr-drawer/drawer.sh")
-  cached_runner = fallback
-  return cached_runner
+  return nil
 end
 
 local function run_drawer(action, extra_args)
   sync_nvim_cwd()
-  local runner = resolve_drawer_runner()
+  local bin = resolve_drawer_bin()
+  if not bin then
+    vim.notify("herdr-drawer: binary not found in herdr plugin directory", vim.log.levels.WARN)
+    return
+  end
   local cmd = {
-    runner,
+    bin,
     action,
     "--from-nvim",
     "--pane",
@@ -137,3 +151,5 @@ end, { desc = "Toggle herdr terminal drawer", silent = true })
 vim.keymap.set({ "n", "t" }, "<C-_>", function()
   run_drawer("toggle")
 end, { desc = "Toggle herdr terminal drawer", silent = true })
+
+return {}

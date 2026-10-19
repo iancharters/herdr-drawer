@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -243,4 +245,35 @@ func TestSessionHostPersistAcrossReconnect(t *testing.T) {
 		t.Fatalf("expected persisted env var across reconnect, got output: %q", collected.String())
 	}
 }
+
+func TestRunSetupInteractiveDefaultAndOverride(t *testing.T) {
+	tmpConfig := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpConfig)
+
+	var out bytes.Buffer
+	if err := runSetup("", true, strings.NewReader("\n\n"), &out); err != nil {
+		t.Fatalf("runSetup default: %v", err)
+	}
+	expectedDefault := filepath.Join(tmpConfig, "nvim", "lua", "plugins", "herdr-drawer.lua")
+	data, err := os.ReadFile(expectedDefault)
+	if err != nil {
+		t.Fatalf("read default config: %v", err)
+	}
+	if !strings.Contains(string(data), "editor/nvim.lua") || !strings.Contains(string(data), "return {}") {
+		t.Fatalf("unexpected loader content: %s", string(data))
+	}
+	if !strings.Contains(out.String(), "Restart Neovim for the changes to take effect.") {
+		t.Fatalf("expected restart prompt in output: %s", out.String())
+	}
+
+	customPath := filepath.Join(tmpConfig, "custom", "my-drawer.lua")
+	out.Reset()
+	if err := runSetup("", true, strings.NewReader(customPath+"\n\n"), &out); err != nil {
+		t.Fatalf("runSetup override: %v", err)
+	}
+	if _, err := os.Stat(customPath); err != nil {
+		t.Fatalf("expected custom config at %s: %v", customPath, err)
+	}
+}
+
 

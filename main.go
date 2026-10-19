@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -354,11 +355,15 @@ func readSyncedCwd(paneID string) string {
 	if paneID == "" {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(stateDir(), "cwd", sanitizePaneID(paneID)))
-	if err != nil {
-		return ""
+	name := sanitizePaneID(paneID)
+	for _, dir := range []string{stateDir(), baseStateDir()} {
+		if data, err := os.ReadFile(filepath.Join(dir, "cwd", name)); err == nil {
+			if s := strings.TrimSpace(string(data)); s != "" {
+				return s
+			}
+		}
 	}
-	return strings.TrimSpace(string(data))
+	return ""
 }
 
 func resolveAnchorCwd(client *RPCClient, anchor PaneInfo, explicitCwd string) string {
@@ -1155,6 +1160,143 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
 	})
 }
 
+const nvimPluginLoaderLua = `local function find_herdr_drawer()
+  local config_dir = vim.env.XDG_CONFIG_HOME
+  if not config_dir or config_dir == "" then
+    config_dir = vim.fn.expand("~/.config")
+  end
+  local plugins_file = config_dir .. "/herdr/plugins.json"
+  local uv = vim.uv or vim.loop
+  if uv and uv.fs_stat(plugins_file) then
+    local ok, lines = pcall(vim.fn.readfile, plugins_file)
+    if ok and lines then
+      local decoded_ok, plugins = pcall(vim.json.decode, table.concat(lines, "\n"))
+      if decoded_ok and type(plugins) == "table" then
+        for _, plugin in ipairs(plugins) do
+          if
+            type(plugin) == "table"
+            and plugin.plugin_root
+            and (
+              plugin.plugin_id == "herdr-drawer"
+              or (type(plugin.plugin_id) == "string" and plugin.plugin_id:match("%.herdr%-drawer$"))
+            )
+          then
+            local script = plugin.plugin_root .. "/editor/nvim.lua"
+            if uv.fs_stat(script) then
+              return script
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+local script = find_herdr_drawer()
+if script then
+  dofile(script)
+end
+
+return {}
+`
+
+func defaultNvimPluginPath() string {
+	configDir := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
+	if configDir == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			configDir = filepath.Join(home, ".config")
+		} else {
+			configDir = ".config"
+		}
+	}
+	return filepath.Join(configDir, "nvim", "lua", "plugins", "herdr-drawer.lua")
+}
+
+func displayHomePath(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if p == home {
+			return "~"
+		}
+		if strings.HasPrefix(p, home+string(os.PathSeparator)) {
+			return "~" + p[len(home):]
+		}
+	}
+	return p
+}
+
+func expandNvimConfigPath(input, defaultPath string) string {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return defaultPath
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if raw == "~" {
+			raw = home
+		} else if strings.HasPrefix(raw, "~/") {
+			raw = filepath.Join(home, raw[2:])
+		}
+	}
+	if strings.HasSuffix(raw, "/") || strings.HasSuffix(raw, string(os.PathSeparator)) {
+		return filepath.Join(raw, "herdr-drawer.lua")
+	}
+	if st, err := os.Stat(raw); err == nil && st.IsDir() {
+		return filepath.Join(raw, "herdr-drawer.lua")
+	}
+	return filepath.Clean(raw)
+}
+
+func isStdinTTY() bool {
+	st, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (st.Mode() & os.ModeCharDevice) != 0
+}
+
+func runSetup(explicitPath string, popup bool, in io.Reader, out io.Writer) error {
+	if strings.TrimSpace(explicitPath) == "" && !popup && !isStdinTTY() {
+		sock, err := resolveSocketPath()
+		if err != nil {
+			return err
+		}
+		client := &RPCClient{socketPath: sock}
+		return client.Call("plugin.pane.open", map[string]interface{}{
+			"plugin_id":  pluginID,
+			"entrypoint": "setup",
+			"placement":  "popup",
+			"focus":      true,
+		}, nil)
+	}
+
+	defPath := defaultNvimPluginPath()
+	reader := bufio.NewReader(in)
+	targetPath := strings.TrimSpace(explicitPath)
+	if targetPath == "" {
+		fmt.Fprintf(out, "Install Neovim plugin config to [%s]\nPress Enter for default, or type a custom path: ", displayHomePath(defPath))
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		targetPath = expandNvimConfigPath(line, defPath)
+	} else {
+		targetPath = expandNvimConfigPath(targetPath, defPath)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return fmt.Errorf("create directory %s: %w", filepath.Dir(targetPath), err)
+	}
+	if err := os.WriteFile(targetPath, []byte(nvimPluginLoaderLua), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", targetPath, err)
+	}
+
+	fmt.Fprintf(out, "\nInstalled Neovim plugin config to %s\nRestart Neovim for the changes to take effect.\n", displayHomePath(targetPath))
+	if popup {
+		fmt.Fprint(out, "\nPress Enter to close...")
+		_, _ = reader.ReadString('\n')
+	}
+	return nil
+}
+
 func main() {
 	action := "toggle"
 	args := os.Args[1:]
@@ -1168,16 +1310,20 @@ func main() {
 	var cwd string
 	var direction string
 	var sessionID string
+	var setupPath string
 	var rows int
 	var cols int
 	var fromNvim bool
+	var popup bool
 	fs.StringVar(&paneID, "pane", "", "Target pane ID")
 	fs.StringVar(&cwd, "cwd", "", "Working directory for new drawer")
 	fs.StringVar(&direction, "direction", "right", "Split direction (right or down)")
 	fs.StringVar(&sessionID, "session", "", "Drawer PTY session ID")
+	fs.StringVar(&setupPath, "path", "", "Target path for Neovim plugin config (used with setup)")
 	fs.IntVar(&rows, "rows", 24, "Initial PTY rows")
 	fs.IntVar(&cols, "cols", 80, "Initial PTY cols")
 	fs.BoolVar(&fromNvim, "from-nvim", false, "Invoked from Neovim")
+	fs.BoolVar(&popup, "popup", false, "Wait for Enter before closing setup popup")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "herdr-drawer: %v\n", err)
 		os.Exit(2)
@@ -1193,6 +1339,12 @@ func main() {
 	case "attach":
 		if err := runAttach(sessionID, cwd); err != nil {
 			fmt.Fprintf(os.Stderr, "herdr-drawer attach: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	case "setup", "install-nvim":
+		if err := runSetup(setupPath, popup, os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "herdr-drawer setup: %v\n", err)
 			os.Exit(1)
 		}
 		return

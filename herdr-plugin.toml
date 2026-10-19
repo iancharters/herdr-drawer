@@ -5,35 +5,45 @@ min_herdr_version = "0.7.0"
 description = "VS Code-style persistent, multi-pane bottom terminal drawer scoped to each herdr tab"
 platforms = ["linux", "macos"]
 
+[[build]]
+platforms = ["linux", "macos"]
+command = ["sh", "scripts/build.sh"]
+
 [[actions]]
 id = "toggle"
 title = "Toggle terminal drawer"
 contexts = ["global"]
-command = ["bash", "drawer.sh", "toggle"]
+command = ["bin/herdr-drawer", "toggle"]
 
 [[actions]]
 id = "open"
 title = "Open terminal drawer"
 contexts = ["global"]
-command = ["bash", "drawer.sh", "open"]
+command = ["bin/herdr-drawer", "open"]
 
 [[actions]]
 id = "close"
 title = "Close terminal drawer"
 contexts = ["global"]
-command = ["bash", "drawer.sh", "close"]
+command = ["bin/herdr-drawer", "close"]
 
 [[actions]]
 id = "split-right"
 title = "Split drawer pane right"
 contexts = ["global"]
-command = ["bash", "drawer.sh", "split", "--direction", "right"]
+command = ["bin/herdr-drawer", "split", "--direction", "right"]
 
 [[actions]]
 id = "split-down"
 title = "Split drawer pane down"
 contexts = ["global"]
-command = ["bash", "drawer.sh", "split", "--direction", "down"]
+command = ["bin/herdr-drawer", "split", "--direction", "down"]
+
+[[actions]]
+id = "setup"
+title = "Setup Neovim integration"
+contexts = ["global"]
+command = ["bin/herdr-drawer", "setup"]
 
 [[panes]]
 id = "drawer"
@@ -41,5 +51,14 @@ title = "Drawer"
 description = "Persistent bottom terminal drawer pane"
 platforms = ["linux", "macos"]
 placement = "split"
-command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/drawer.sh\" attach"]
+command = ["bin/herdr-drawer", "attach"]
 
+[[panes]]
+id = "setup"
+title = "Herdr Drawer Setup"
+description = "Interactive Neovim configuration installer"
+platforms = ["linux", "macos"]
+placement = "popup"
+width = "70%"
+height = "35%"
+command = ["bin/herdr-drawer", "setup", "--popup"]

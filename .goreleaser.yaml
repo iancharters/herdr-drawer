@@ -1,0 +1,45 @@
+version: 2
+
+project_name: herdr-drawer
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: herdr-drawer
+    main: .
+    binary: herdr-drawer
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - herdr-plugin.toml
+      - editor/*
+      - scripts/*
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

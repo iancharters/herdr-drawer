@@ -11,27 +11,26 @@ Press `Ctrl+/` from Neovim (or any pane) to open a bottom terminal drawer in you
 ## Requirements
 
 - `herdr` `>= 0.7.0`
-- Go `>= 1.22` (used to build the fast native socket client `bin/herdr-drawer`; `drawer.sh` compiles it automatically on first run if needed)
 - macOS or Linux
 
 ---
 
 ## Installation
 
-### 1. Install or Link the Plugin in `herdr`
+### 1. Install the Plugin in `herdr`
 
-From a local checkout:
+```bash
+herdr plugin install iancharters/herdr-drawer
+```
+
+During installation, `herdr` runs the plugin's `[[build]]` step (`scripts/build.sh`) once to download the prebuilt `herdr-drawer` binary for your OS/architecture from GitHub Releases into the plugin's `bin/herdr-drawer` directory (falling back to `go build` if Go is installed and no release asset is found).
+
+Or from a local checkout:
 
 ```bash
 git clone https://github.com/iancharters/herdr-drawer.git ~/dev/herdr-plugins/herdr-drawer
 cd ~/dev/herdr-plugins/herdr-drawer
 make link
-```
-
-Or link directly with the `herdr` CLI:
-
-```bash
-herdr plugin link ~/dev/herdr-plugins/herdr-drawer --enabled
 ```
 
 Verify the plugin actions are registered:
@@ -74,18 +73,17 @@ Reload `herdr`'s configuration (`prefix+shift+r`) after saving `config.toml`.
 
 ### 3. Configure Neovim
 
-To ensure the drawer always opens in Neovim's active working directory (even when you change directories inside Neovim via `:cd`, `:lcd`, `:tcd`, or a file explorer plugin) and to provide `:HerdrDrawer*` commands and fallback `<C-/>` keymaps, copy [`example/herdr-drawer.lua`](example/herdr-drawer.lua) into your Neovim configuration:
+To ensure the drawer always opens in Neovim's active working directory (even when you change directories inside Neovim via `:cd`, `:lcd`, `:tcd`, or a file explorer plugin) and to provide `:HerdrDrawer*` commands and fallback `<C-/>` keymaps, run the interactive setup command:
 
 ```bash
-mkdir -p ~/.config/nvim/plugin
-cp ~/dev/herdr-plugins/herdr-drawer/example/herdr-drawer.lua ~/.config/nvim/plugin/herdr-drawer.lua
+# From inside herdr (opens an interactive setup popup):
+herdr plugin action invoke herdr-drawer.setup
+
+# Or from a local checkout in your terminal:
+make setup
 ```
 
-Or source it from your `init.lua` / `lua/config/keymaps.lua`:
-
-```lua
-dofile(vim.fn.expand("~/dev/herdr-plugins/herdr-drawer/example/herdr-drawer.lua"))
-```
+You will be prompted for the destination path (defaulting to `~/.config/nvim/lua/plugins/herdr-drawer.lua` — press `Enter` to accept or type a custom path). It installs a small loader that locates `herdr-drawer`'s installed `plugin_root` in `~/.config/herdr/plugins.json` and loads `editor/nvim.lua` directly from the `herdr` plugin directory. Restart Neovim after running setup.
 
 ---
 
@@ -165,10 +163,11 @@ Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the draw
 ## Development
 
 ```bash
-make build   # compile bin/herdr-drawer
+make build   # compile bin/herdr-drawer from source
+make setup   # interactively install the Neovim plugin loader
 make test    # run Go unit tests
 make vet     # run go vet
-make link    # build and link plugin into herdr
+make link    # build and link local checkout into herdr
 ```
 
 ## License
