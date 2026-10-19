@@ -244,11 +244,28 @@ func (c *RPCClient) FocusPane(paneID string) error {
 	return c.Call("pane.focus", map[string]interface{}{"pane_id": paneID}, nil)
 }
 
-func stateDir() string {
+func baseStateDir() string {
 	if d := os.Getenv("HERDR_DRAWER_STATE_DIR"); d != "" {
 		return d
 	}
 	return fmt.Sprintf("/tmp/herdr-drawer-%d", os.Getuid())
+}
+
+func stateDir() string {
+	base := baseStateDir()
+	if os.Getenv("HERDR_DRAWER_STATE_DIR") != "" {
+		return base
+	}
+	sock := os.Getenv("HERDR_SOCKET_PATH")
+	if sock == "" || strings.HasSuffix(sock, "/herdr/herdr.sock") {
+		return base
+	}
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(sock); i++ {
+		h ^= uint64(sock[i])
+		h *= 1099511628211
+	}
+	return filepath.Join(base, fmt.Sprintf("srv-%016x", h))
 }
 
 func withStateLock(fn func(*StateFile) error) error {

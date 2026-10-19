@@ -4,6 +4,8 @@ A VS Code-style persistent, multi-pane bottom terminal drawer for [herdr](https:
 
 Press `Ctrl+/` from Neovim (or any pane) to open a bottom terminal drawer in your editor's current working directory. Split the drawer into multiple panes, resize them, close splits, and press `Ctrl+/` again from **either Neovim or the drawer terminal** to hide the drawer — **without zooming your editor pane or hiding sibling panes** (like an AI agent or side panel) beside it. Press `Ctrl+/` again to restore the exact same multi-pane split arrangement and running shell processes.
 
+![herdr-drawer demo](assets/demo.gif)
+
 ---
 
 ## Why Not Pane Zoom or Popups?
@@ -63,7 +65,7 @@ Split panes inside the drawer using either standard `herdr` split keybindings or
 ```
 
 ### 4. Press `Ctrl+/` Again (from Neovim or the Drawer) -> Drawer Hides
-Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the drawer's binary split tree (`Split(right, 0.5, sess_A, sess_B)` + drawer height ratio) and closes the drawer panes in `herdr` while keeping their underlying shells alive in detached background PTY session hosts (`herdr-drawer host`). `Neovim` reclaims its full height, `Agent` (`w1:p2`) stays visible, and **no extra workspace or tab ever appears in `herdr`'s workspace or tab bars**. Pressing `Ctrl+/` again recreates the split tree via `plugin.pane.open` and re-attaches each pane to its persistent PTY session with full screen replay.
+Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the drawer's binary split tree (`Split(right, 0.5, sess_A, sess_B)` + drawer height ratio) and closes the drawer panes in `herdr` while keeping their underlying shells alive inside a single background multiplexer daemon (`herdr-drawer daemon`). `Neovim` reclaims its full height, `Agent` (`w1:p2`) stays visible, and **no extra workspace or tab ever appears in `herdr`'s workspace or tab bars**. Pressing `Ctrl+/` again recreates the split tree via `plugin.pane.open` and re-attaches each pane to its persistent PTY session in the daemon with full screen replay.
 
 ---
 
@@ -81,17 +83,24 @@ flowchart TD
     subgraph hideSubgraph ["Hide Drawer (Zero Extra Workspaces)"]
         HideFlow --> SnapshotTree["Snapshot drawer binary split tree D (session_ids, directions, ratios) & drawer height ratio"]
         SnapshotTree --> FocusEditor["Focus anchor pane (Neovim)"]
-        FocusEditor --> ClosePanes["Close drawer panes in herdr via pane.close (detached PTY session hosts stay alive)"]
+        FocusEditor --> ClosePanes["Close drawer panes in herdr via pane.close (PTY sessions stay alive in herdr-drawer daemon)"]
     end
 
     subgraph showSubgraph ["Show / Restore Drawer"]
-        ShowFlow --> HasAlivePanes{"Are detached PTY sessions alive?"}
+        ShowFlow --> HasAlivePanes{"Are PTY sessions alive in herdr-drawer daemon?"}
         HasAlivePanes -->|"No (First Open)"| ResolveCwd["Resolve Neovim cwd (synced getcwd() or pane.process_info)"]
-        ResolveCwd --> SplitDown["Open plugin split pane down (ratio 0.70) attached to new PTY session"]
+        ResolveCwd --> SplitDown["Open plugin split pane down (ratio 0.70) attached to new daemon PTY session"]
         HasAlivePanes -->|"Yes (Restore Arrangement)"| PreOrder["Pre-order traverse saved tree D: plugin.pane.open & layout.set_split_ratio to re-attach live PTY sessions"]
         PreOrder --> RestoreFocus["Focus last active drawer pane"]
     end
 ```
+
+### Single Multiplexer Daemon & Event-Driven Lifecycle (`events.subscribe`)
+
+- **Single Per-Server Daemon (`herdr-drawer daemon`)**: One lightweight background process per `herdr` server listens on `/tmp/herdr-drawer-<uid>/daemon.sock` and multiplexes all drawer PTY sessions (`map[session_id]*ptySession`) along with a `128 KB` screen replay ring buffer per pane.
+- **Zero-Polling Push Subscriptions (`events.subscribe`)**: The daemon holds a single persistent connection to `$HERDR_SOCKET_PATH` subscribed to `pane.created`, `pane.closed`, `tab.closed`, and `workspace.closed`:
+  - **Automatic Native Split Adoption**: When you split a drawer pane using standard `herdr` keybindings (`prefix+v`, `prefix+s`, `prefix+-`), `herdr` emits `pane_created`. The daemon immediately detects the new native split leaf inside the drawer subtree, allocates a persistent PTY session for it (inheriting the sibling drawer session's `cwd`), and swaps it in-place in the binary split tree so both split geometry (`direction` and `ratio`) and shell state survive hide/unhide.
+  - **Zero-CPU Idle & Instant Cleanup**: While idle, the daemon blocks on kernel socket reads (`kqueue` on macOS, `epoll` on Linux) with **0 timers and 0% CPU**. Closing a drawer pane, tab, or workspace reconciles orphaned PTYs immediately, and stopping `herdr` wakes the socket with `EOF` in `<1ms` to tear down all drawer shells.
 
 ### Split-Tree Snapshot & Pre-Order Reconstruction
 
@@ -116,7 +125,7 @@ flowchart TD
 ```
 
 - **Hiding**: `herdr-drawer` exports `DrawerSplit.second` as a tree of persistent `session_id`s (`sess_A`, `sess_B`) along with each split's `direction` and `ratio`, then closes the drawer panes in `herdr`. Removing those leaves collapses `DrawerSplit` back into `EditorPane` (`w1:p1`) without touching `AgentPane` (`w1:p2`) and without creating any stash workspace in `herdr`'s sidebar.
-- **Unhiding**: Traversing the saved binary tree `D` in **pre-order** via `plugin.pane.open` and `layout.set_split_ratio` reconstructs any arbitrary combination of nested horizontal and vertical splits with their exact ratios and re-attaches each pane (`herdr-drawer attach`) to its background PTY host (`herdr-drawer host`), replaying the ring buffer so output and running processes are preserved seamlessly.
+- **Unhiding**: Traversing the saved binary tree `D` in **pre-order** via `plugin.pane.open` and `layout.set_split_ratio` reconstructs any arbitrary combination of nested horizontal and vertical splits with their exact ratios and re-attaches each pane (`herdr-drawer attach`) to the background multiplexer daemon (`herdr-drawer daemon`), replaying the ring buffer so output and running processes are preserved seamlessly.
 
 ---
 
