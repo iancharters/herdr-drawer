@@ -344,40 +344,12 @@ func runHost(sessionID, cwd string, initRows, initCols uint16) error {
 	}()
 
 	if os.Getenv("HERDR_DRAWER_NO_WATCHDOG") == "" {
-		go func() {
-			// Allow initial showDrawer/split state.json write to complete.
-			select {
-			case <- time.After(2 * time.Second):
-			case <-doneCh:
-				return
-			}
-
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-doneCh:
-					return
-				case <-disconnectCh:
-					select {
-					case <-time.After(350 * time.Millisecond):
-					case <-doneCh:
-						return
-					}
-				case <-ticker.C:
-				}
-
-				clientMu.Lock()
-				attached := activeConn != nil
-				clientMu.Unlock()
-
-				if !shouldKeepSessionAlive(sessionID, attached) {
-					terminateShell()
-					return
-				}
-			}
-		}()
+		isAttached := func() bool {
+			clientMu.Lock()
+			defer clientMu.Unlock()
+			return activeConn != nil
+		}
+		go watchHerdrEvents(sessionID, doneCh, disconnectCh, isAttached, terminateShell)
 	}
 
 	go func() {
@@ -510,6 +482,102 @@ func runHost(sessionID, cwd string, initRows, initCols uint16) error {
 				_ = c.Close()
 			}
 		}(conn)
+	}
+}
+
+type herdrEventEnvelope struct {
+	Event string `json:"event"`
+	Data  struct {
+		Pane PaneInfo `json:"pane"`
+	} `json:"data"`
+}
+
+func watchHerdrEvents(sessionID string, doneCh <-chan struct{}, disconnectCh <-chan struct{}, isAttached func() bool, terminateShell func()) {
+	sockPath, err := resolveSocketPath()
+	if err != nil {
+		return
+	}
+
+	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	if err != nil {
+		terminateShell()
+		return
+	}
+	defer conn.Close()
+
+	go func() {
+		<-doneCh
+		_ = conn.Close()
+	}()
+
+	req := rpcRequest{
+		ID:     "host-watch",
+		Method: "events.subscribe",
+		Params: map[string]any{
+			"subscriptions": []map[string]any{
+				{"type": "pane.created"},
+				{"type": "pane.closed"},
+				{"type": "tab.closed"},
+				{"type": "workspace.closed"},
+			},
+		},
+	}
+	reqBytes, _ := json.Marshal(req)
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(append(reqBytes, '\n')); err != nil {
+		terminateShell()
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	type streamMsg struct {
+		line []byte
+		err  error
+	}
+	msgCh := make(chan streamMsg, 16)
+	go func() {
+		reader := bufio.NewReader(conn)
+		for {
+			line, err := reader.ReadBytes('\n')
+			msgCh <- streamMsg{line: line, err: err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	verifyCh := time.After(2 * time.Second)
+
+	for {
+		select {
+		case <-doneCh:
+			return
+		case <-disconnectCh:
+			verifyCh = time.After(350 * time.Millisecond)
+		case <-verifyCh:
+			verifyCh = nil
+			if !shouldKeepSessionAlive(sessionID, isAttached()) {
+				terminateShell()
+				return
+			}
+		case msg := <-msgCh:
+			if msg.err != nil {
+				terminateShell()
+				return
+			}
+			var ev herdrEventEnvelope
+			if err := json.Unmarshal(msg.line, &ev); err != nil || ev.Event == "" {
+				continue
+			}
+			switch ev.Event {
+			case "pane_created":
+				if ev.Data.Pane.Label == "" && ev.Data.Pane.TabID != "" {
+					_ = adoptNativeDrawerSplits(ev.Data.Pane.TabID)
+				}
+			case "pane_closed", "tab_closed", "workspace_closed":
+				verifyCh = time.After(350 * time.Millisecond)
+			}
+		}
 	}
 }
 

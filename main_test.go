@@ -85,6 +85,11 @@ func TestFindDrawerSplitAndSnapshot(t *testing.T) {
 	if !reflect.DeepEqual(path, expectedPath) {
 		t.Fatalf("expected path %v, got %v", expectedPath, path)
 	}
+
+	sib := findSiblingSessionID(split.Second, "w4:p6", paneToTerm, termToSession)
+	if sib != "s-111" {
+		t.Fatalf("expected sibling session s-111 for w4:p6, got %q", sib)
+	}
 }
 
 func TestPruneDrawerTree(t *testing.T) {
@@ -138,6 +143,7 @@ func TestRingBuffer(t *testing.T) {
 }
 
 func TestSessionHostPersistAcrossReconnect(t *testing.T) {
+	t.Setenv("HERDR_DRAWER_NO_WATCHDOG", "1")
 	sessID := newSessionID()
 	defer killSession(sessID)
 

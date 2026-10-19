@@ -47,6 +47,7 @@ type PaneInfo struct {
 	TabID         string `json:"tab_id"`
 	WorkspaceID   string `json:"workspace_id"`
 	TerminalID    string `json:"terminal_id"`
+	Label         string `json:"label"`
 	Cwd           string `json:"cwd"`
 	ForegroundCwd string `json:"foreground_cwd"`
 	Focused       bool   `json:"focused"`
@@ -565,6 +566,148 @@ func firstLayoutPaneID(node *LayoutNode) string {
 	return firstLayoutPaneID(node.Second)
 }
 
+func findSiblingSessionID(node *LayoutNode, targetPaneID string, paneToTerm map[string]string, termToSession map[string]string) string {
+	if node == nil || node.Type != "split" {
+		return ""
+	}
+	if s := findSiblingSessionID(node.First, targetPaneID, paneToTerm, termToSession); s != "" {
+		return s
+	}
+	if s := findSiblingSessionID(node.Second, targetPaneID, paneToTerm, termToSession); s != "" {
+		return s
+	}
+	if layoutContainsPane(node.Second, targetPaneID) {
+		if sibPaneID := firstLayoutPaneID(node.First); sibPaneID != "" {
+			return termToSession[paneToTerm[sibPaneID]]
+		}
+	}
+	if layoutContainsPane(node.First, targetPaneID) {
+		if sibPaneID := firstLayoutPaneID(node.Second); sibPaneID != "" {
+			return termToSession[paneToTerm[sibPaneID]]
+		}
+	}
+	return ""
+}
+
+func ensureDrawerSubtreeSessions(node *LayoutNode, paneByID map[string]PaneInfo, termToSession map[string]string) {
+	for _, paneID := range collectLayoutPaneIDs(node) {
+		p, ok := paneByID[paneID]
+		if !ok || p.TerminalID == "" || termToSession[p.TerminalID] != "" {
+			continue
+		}
+		cwd := p.ForegroundCwd
+		if cwd == "" {
+			cwd = p.Cwd
+		}
+		newSessID := newSessionID()
+		_ = ensureSessionHost(newSessID, cwd, 24, 80)
+		termToSession[p.TerminalID] = newSessID
+	}
+}
+
+func adoptNativeDrawerSplits(tabID string) error {
+	if tabID == "" {
+		return nil
+	}
+	sock, err := resolveSocketPath()
+	if err != nil {
+		return err
+	}
+	client := &RPCClient{socketPath: sock}
+
+	return withStateLock(func(sf *StateFile) error {
+		ts, ok := sf.Tabs[tabID]
+		if !ok || !ts.Visible || ts.AnchorTerminalID == "" {
+			return nil
+		}
+		if ts.TermToSession == nil {
+			ts.TermToSession = map[string]string{}
+		}
+
+		panes, err := client.ListPanes()
+		if err != nil {
+			return err
+		}
+		paneByID := make(map[string]PaneInfo, len(panes))
+		paneToTerm := make(map[string]string, len(panes))
+		termToPane := make(map[string]PaneInfo, len(panes))
+		for _, p := range panes {
+			paneByID[p.PaneID] = p
+			paneToTerm[p.PaneID] = p.TerminalID
+			termToPane[p.TerminalID] = p
+		}
+
+		anchorPane, ok := termToPane[ts.AnchorTerminalID]
+		if !ok || anchorPane.TabID != tabID {
+			return nil
+		}
+
+		layout, err := client.ExportLayout(tabID)
+		if err != nil {
+			return err
+		}
+
+		drawerSplit := findDrawerSplit(&layout.Root, anchorPane.PaneID, paneToTerm, ts.TermToSession, false)
+		if drawerSplit == nil {
+			return nil
+		}
+
+		drawerPaneIDs := collectLayoutPaneIDs(drawerSplit.Second)
+		adoptedAny := false
+		for _, paneID := range drawerPaneIDs {
+			p, ok := paneByID[paneID]
+			if !ok || p.TerminalID == "" || ts.TermToSession[p.TerminalID] != "" {
+				continue
+			}
+
+			cwd := ""
+			if sibSess := findSiblingSessionID(drawerSplit.Second, p.PaneID, paneToTerm, ts.TermToSession); sibSess != "" {
+				cwd = sessionCwd(sibSess)
+			}
+			if cwd == "" && ts.FocusedSessionID != "" {
+				cwd = sessionCwd(ts.FocusedSessionID)
+			}
+			if cwd == "" {
+				cwd = p.ForegroundCwd
+			}
+			if cwd == "" {
+				cwd = p.Cwd
+			}
+
+			newSessID := newSessionID()
+			_ = ensureSessionHost(newSessID, cwd, 24, 80)
+			newPane, err := client.OpenPluginSplitPane(p.PaneID, "right", cwd, newSessID, p.Focused)
+			if err != nil {
+				killSession(newSessID)
+				continue
+			}
+			_ = client.ClosePane(p.PaneID)
+			if p.Focused {
+				_ = client.FocusPane(newPane.PaneID)
+				ts.FocusedSessionID = newSessID
+			}
+
+			ts.TermToSession[newPane.TerminalID] = newSessID
+			paneByID[newPane.PaneID] = *newPane
+			paneToTerm[newPane.PaneID] = newPane.TerminalID
+			delete(paneByID, p.PaneID)
+			delete(paneToTerm, p.PaneID)
+			adoptedAny = true
+		}
+
+		if adoptedAny {
+			if updatedLayout, err := client.ExportLayout(tabID); err == nil {
+				if updatedSplit := findDrawerSplit(&updatedLayout.Root, anchorPane.PaneID, paneToTerm, ts.TermToSession, false); updatedSplit != nil {
+					if updatedTree := layoutToDrawerTree(updatedSplit.Second, paneByID, ts.TermToSession); updatedTree != nil {
+						ts.Tree = updatedTree
+					}
+				}
+			}
+		}
+		return nil
+	})
+}
+
 func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, direction string, ratio float64, sessionID, cwd string, focus bool) (*PaneInfo, error) {
 	_ = ensureSessionHost(sessionID, cwd, 24, 80)
 	pane, err := client.OpenPluginSplitPane(targetPaneID, direction, cwd, sessionID, focus)
@@ -701,6 +844,7 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 }
 
 func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, drawerSplit *LayoutNode, currentPane *PaneInfo, paneByID map[string]PaneInfo, paneToTerm map[string]string, termToPane map[string]PaneInfo) error {
+	ensureDrawerSubtreeSessions(drawerSplit.Second, paneByID, ts.TermToSession)
 	tree := layoutToDrawerTree(drawerSplit.Second, paneByID, ts.TermToSession)
 	if tree == nil {
 		return errors.New("drawer split had no valid panes")
