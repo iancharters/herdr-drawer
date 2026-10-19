@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -143,27 +144,45 @@ func TestRingBuffer(t *testing.T) {
 }
 
 func TestSessionHostPersistAcrossReconnect(t *testing.T) {
+	testDir := "/tmp/herdr-drawer-test-" + newSessionID()
+	defer os.RemoveAll(testDir)
+	t.Setenv("HERDR_DRAWER_STATE_DIR", testDir)
 	t.Setenv("HERDR_DRAWER_NO_WATCHDOG", "1")
 	sessID := newSessionID()
+	sessID2 := newSessionID()
 	defer killSession(sessID)
+	defer killSession(sessID2)
 
 	go func() {
-		_ = runHost(sessID, "/tmp", 24, 80)
+		_ = runDaemon()
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !isSessionAlive(sessID) {
+	for time.Now().Before(deadline) && !isDaemonAlive() {
 		time.Sleep(15 * time.Millisecond)
 	}
-	if !isSessionAlive(sessID) {
-		t.Fatalf("session host %s did not become ready", sessID)
+	if !isDaemonAlive() {
+		t.Fatalf("daemon did not become ready")
 	}
 
-	conn1, err := net.DialTimeout("unix", sessionSocketPath(sessID), time.Second)
+	if err := ensureSessionHost(sessID, "/tmp", 24, 80); err != nil {
+		t.Fatalf("ensureSessionHost 1: %v", err)
+	}
+	if err := ensureSessionHost(sessID2, "/tmp", 24, 80); err != nil {
+		t.Fatalf("ensureSessionHost 2: %v", err)
+	}
+	if !isSessionAlive(sessID) || !isSessionAlive(sessID2) {
+		t.Fatalf("sessions did not become ready")
+	}
+	if got := len(listDaemonSessions()); got != 2 {
+		t.Fatalf("expected 2 daemon sessions, got %d", got)
+	}
+
+	conn1, err := net.DialTimeout("unix", daemonSocketPath(), time.Second)
 	if err != nil {
 		t.Fatalf("dial 1: %v", err)
 	}
-	_, _ = conn1.Write([]byte(`{"type":"attach","rows":24,"cols":80}` + "\n"))
+	_, _ = conn1.Write([]byte(`{"type":"attach","session_id":"` + sessID + `","rows":24,"cols":80}` + "\n"))
 
 	cmdStr := "export DRAWER_PERSIST_VAR=alive_42\n"
 	pkt := make([]byte, 3+len(cmdStr))
@@ -174,15 +193,14 @@ func TestSessionHostPersistAcrossReconnect(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	_ = conn1.Close()
 
-	conn2, err := net.DialTimeout("unix", sessionSocketPath(sessID), time.Second)
+	conn2, err := net.DialTimeout("unix", daemonSocketPath(), time.Second)
 	if err != nil {
 		t.Fatalf("dial 2: %v", err)
 	}
 	defer conn2.Close()
-	_, _ = conn2.Write([]byte(`{"type":"attach","rows":24,"cols":80}` + "\n"))
+	_, _ = conn2.Write([]byte(`{"type":"attach","session_id":"` + sessID + `","rows":24,"cols":80}` + "\n"))
 
-	cmdStr2 := "echoRESULT_${DRAWER_PERSIST_VAR}_END\n"
-	cmdStr2 = "echo RESULT_${DRAWER_PERSIST_VAR}_END\n"
+	cmdStr2 := "echo RESULT_${DRAWER_PERSIST_VAR}_END\n"
 	pkt2 := make([]byte, 3+len(cmdStr2))
 	pkt2[0] = frameData
 	binary.BigEndian.PutUint16(pkt2[1:3], uint16(len(cmdStr2)))

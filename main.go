@@ -245,6 +245,9 @@ func (c *RPCClient) FocusPane(paneID string) error {
 }
 
 func stateDir() string {
+	if d := os.Getenv("HERDR_DRAWER_STATE_DIR"); d != "" {
+		return d
+	}
 	return fmt.Sprintf("/tmp/herdr-drawer-%d", os.Getuid())
 }
 
@@ -829,16 +832,9 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 		}
 	}
 
-	if entries, err := os.ReadDir(sessionsDir()); err == nil {
-		for _, entry := range entries {
-			name := entry.Name()
-			if !strings.HasSuffix(name, ".sock") {
-				continue
-			}
-			sessID := strings.TrimSuffix(name, ".sock")
-			if !referencedSessions[sessID] {
-				killSession(sessID)
-			}
+	for _, sessID := range listDaemonSessions() {
+		if !referencedSessions[sessID] {
+			killSession(sessID)
 		}
 	}
 }
@@ -1171,9 +1167,9 @@ func main() {
 	}
 
 	switch action {
-	case "host":
-		if err := runHost(sessionID, cwd, uint16(rows), uint16(cols)); err != nil {
-			fmt.Fprintf(os.Stderr, "herdr-drawer host: %v\n", err)
+	case "daemon", "host":
+		if err := runDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "herdr-drawer daemon: %v\n", err)
 			os.Exit(1)
 		}
 		return
