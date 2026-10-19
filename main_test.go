@@ -143,6 +143,26 @@ func TestRingBuffer(t *testing.T) {
 	}
 }
 
+func TestSanitizeShellEnv(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("FORCE_COLOR", "0")
+	t.Setenv("CURSOR_AGENT", "1")
+	env := sanitizeShellEnv("dumb")
+	hasXterm := false
+	for _, kv := range env {
+		if kv == "TERM=xterm-256color" {
+			hasXterm = true
+		}
+		if strings.HasPrefix(kv, "NO_COLOR=") || strings.HasPrefix(kv, "FORCE_COLOR=") || strings.HasPrefix(kv, "CURSOR_") || kv == "TERM=dumb" {
+			t.Fatalf("unexpected unsanitized env var: %s", kv)
+		}
+	}
+	if !hasXterm {
+		t.Fatalf("expected TERM=xterm-256color in sanitized env")
+	}
+}
+
 func TestSessionHostPersistAcrossReconnect(t *testing.T) {
 	testDir := "/tmp/herdr-drawer-test-" + newSessionID()
 	defer os.RemoveAll(testDir)

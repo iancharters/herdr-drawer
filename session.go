@@ -77,6 +77,7 @@ type sessionHandshake struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
 	Cwd       string `json:"cwd,omitempty"`
+	Term      string `json:"term,omitempty"`
 	Rows      uint16 `json:"rows,omitempty"`
 	Cols      uint16 `json:"cols,omitempty"`
 }
@@ -241,6 +242,7 @@ func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
 		Type:      "ensure",
 		SessionID: sessionID,
 		Cwd:       cwd,
+		Term:      os.Getenv("TERM"),
 		Rows:      rows,
 		Cols:      cols,
 	}, &resp); err != nil {
@@ -378,7 +380,57 @@ func (d *daemonServer) getSession(sessionID string) *ptySession {
 	return d.sessions[sessionID]
 }
 
-func (d *daemonServer) getOrCreateSession(sessionID, cwd string, initRows, initCols uint16) (*ptySession, error) {
+func sanitizeShellEnv(requestedTerm string) []string {
+	termVal := strings.TrimSpace(requestedTerm)
+	if termVal == "" || termVal == "dumb" {
+		if envTerm := strings.TrimSpace(os.Getenv("TERM")); envTerm != "" && envTerm != "dumb" {
+			termVal = envTerm
+		} else {
+			termVal = "xterm-256color"
+		}
+	}
+
+	var env []string
+	hasColorTerm := false
+	for _, kv := range os.Environ() {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "TERM",
+			"NO_COLOR",
+			"FORCE_COLOR",
+			"SHLVL",
+			"GPG_TTY",
+			"SUDO_ASKPASS",
+			"STARSHIP_SESSION_KEY",
+			"AGENT_TRANSCRIPTS",
+			"GLOBAL_AGENT_ENVIRONMENT_VARIABLE_NAMESPACE",
+			"HERDR_DRAWER_SESSION_ID",
+			"HERDR_DRAWER_CWD",
+			"HERDR_PANE_ID",
+			"HERDR_PLUGIN_ACTION_ID",
+			"HERDR_PLUGIN_ENTRYPOINT_ID",
+			"HERDR_PLUGIN_CONTEXT_JSON":
+			continue
+		}
+		if strings.HasPrefix(key, "CURSOR_") || strings.HasPrefix(key, "__CURSOR_") {
+			continue
+		}
+		if key == "COLORTERM" {
+			hasColorTerm = true
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "TERM="+termVal)
+	if !hasColorTerm {
+		env = append(env, "COLORTERM=truecolor")
+	}
+	return env
+}
+
+func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16) (*ptySession, error) {
 	if sessionID == "" {
 		return nil, errors.New("missing session ID")
 	}
@@ -427,27 +479,7 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd string, initRows, initC
 		Setctty: true,
 		Ctty:    0,
 	}
-
-	var env []string
-	hasTerm := false
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "HERDR_DRAWER_SESSION_ID=") ||
-			strings.HasPrefix(kv, "HERDR_DRAWER_CWD=") ||
-			strings.HasPrefix(kv, "HERDR_PANE_ID=") ||
-			strings.HasPrefix(kv, "HERDR_PLUGIN_ACTION_ID=") ||
-			strings.HasPrefix(kv, "HERDR_PLUGIN_ENTRYPOINT_ID=") ||
-			strings.HasPrefix(kv, "HERDR_PLUGIN_CONTEXT_JSON=") {
-			continue
-		}
-		if strings.HasPrefix(kv, "TERM=") {
-			hasTerm = true
-		}
-		env = append(env, kv)
-	}
-	if !hasTerm {
-		env = append(env, "TERM=xterm-256color")
-	}
-	cmd.Env = env
+	cmd.Env = sanitizeShellEnv(requestedTerm)
 
 	if err := cmd.Start(); err != nil {
 		_ = slave.Close()
@@ -534,7 +566,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "ensure":
-		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Rows, hs.Cols)
+		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols)
 		if err != nil {
 			resp, _ := json.Marshal(map[string]any{"alive": false, "error": err.Error()})
 			_, _ = c.Write(append(resp, '\n'))
@@ -591,7 +623,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "attach":
-		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Rows, hs.Cols)
+		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols)
 		if err != nil {
 			_ = c.Close()
 			return
@@ -898,6 +930,7 @@ func runAttach(sessionID, cwd string) error {
 		Type:      "attach",
 		SessionID: sessionID,
 		Cwd:       cwd,
+		Term:      os.Getenv("TERM"),
 		Rows:      rows,
 		Cols:      cols,
 	})
