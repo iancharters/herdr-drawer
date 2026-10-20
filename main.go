@@ -1220,7 +1220,55 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 	return nil
 }
 
-func runAction(action, explicitPaneID, explicitCwd, splitDir, profileName string) error {
+func cleanupSessions(client *RPCClient, sf *StateFile, termToPane map[string]PaneInfo, workspaceID string, all bool) {
+	targetTabs := map[string]bool{}
+	if !all && workspaceID != "" {
+		for _, p := range termToPane {
+			if p.WorkspaceID == workspaceID {
+				targetTabs[p.TabID] = true
+			}
+		}
+	}
+
+	for stateID, ts := range sf.Tabs {
+		if ts == nil {
+			delete(sf.Tabs, stateID)
+			continue
+		}
+		matches := all
+		if !matches {
+			if workspaceID != "" {
+				matches = ts.WorkspaceID == workspaceID || targetTabs[ts.TabID]
+			}
+		}
+		if !matches {
+			continue
+		}
+
+		sessions := map[string]bool{}
+		collectDrawerSessions(ts.Tree, sessions)
+		for termID, sessID := range ts.TermToSession {
+			if sessID != "" {
+				sessions[sessID] = true
+			}
+			if p, ok := termToPane[termID]; ok {
+				_ = client.ClosePane(p.PaneID)
+			}
+		}
+		for sessID := range sessions {
+			killSession(sessID)
+		}
+		delete(sf.Tabs, stateID)
+	}
+
+	if all {
+		for _, sessID := range listDaemonSessions() {
+			killSession(sessID)
+		}
+	}
+}
+
+func runAction(action, explicitPaneID, explicitCwd, splitDir, profileName, cleanupScope string) error {
 	sock, err := resolveSocketPath()
 	if err != nil {
 		return err
@@ -1253,6 +1301,23 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir, profileName string
 			paneByID[p.PaneID] = p
 			paneToTerm[p.PaneID] = p.TerminalID
 			termToPane[p.TerminalID] = p
+		}
+
+		if action == "cleanup" {
+			scope := strings.ToLower(strings.TrimSpace(cleanupScope))
+			if scope == "" {
+				scope = "workspace"
+			}
+			if scope == "all" {
+				cleanupSessions(client, sf, termToPane, "", true)
+				return nil
+			}
+			currentPane, err := findTargetPane(panes, explicitPaneID)
+			if err != nil {
+				return err
+			}
+			cleanupSessions(client, sf, termToPane, currentPane.WorkspaceID, false)
+			return nil
 		}
 
 		gcOrphanedDrawers(client, sf, panes, termToPane)
@@ -1544,6 +1609,7 @@ func main() {
 	var paneID string
 	var cwd string
 	var direction string
+	var scope string
 	var sessionID string
 	var profileName string
 	var setupPath string
@@ -1554,6 +1620,7 @@ func main() {
 	fs.StringVar(&paneID, "pane", "", "Target pane ID")
 	fs.StringVar(&cwd, "cwd", "", "Working directory for new drawer")
 	fs.StringVar(&direction, "direction", "right", "Split direction (right or down)")
+	fs.StringVar(&scope, "scope", "workspace", "Scope for cleanup action (workspace or all)")
 	fs.StringVar(&sessionID, "session", "", "Drawer PTY session ID")
 	fs.StringVar(&profileName, "profile", "", "Profile name from profiles.toml")
 	fs.StringVar(&setupPath, "path", "", "Target path for Neovim plugin config (used with setup)")
@@ -1587,7 +1654,7 @@ func main() {
 		return
 	}
 
-	if err := runAction(action, paneID, cwd, direction, profileName); err != nil {
+	if err := runAction(action, paneID, cwd, direction, profileName, scope); err != nil {
 		fmt.Fprintf(os.Stderr, "herdr-drawer: %v\n", err)
 		os.Exit(1)
 	}

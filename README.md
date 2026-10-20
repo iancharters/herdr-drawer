@@ -111,6 +111,18 @@ command = "opencode --project {{cwd}}"
 
 `scope = "anchor"` keeps behavior local to the pane you trigger from (for example, drawer under Neovim only). `scope = "tab"` applies the utility split against the full tab root so the pane spans the tab dimension for that side.
 
+### 2.2 Cleanup commands
+
+If you have many hidden utility sessions, you can clean them up directly:
+
+```bash
+# current workspace only
+herdr plugin action invoke herdr-drawer.cleanup-workspace --plugin herdr-drawer
+
+# all workspaces/tabs
+herdr plugin action invoke herdr-drawer.cleanup-all --plugin herdr-drawer
+```
+
 Bind arbitrary keys to specific profiles:
 
 ```toml

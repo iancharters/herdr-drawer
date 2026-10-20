@@ -45,6 +45,18 @@ title = "Setup Neovim integration"
 contexts = ["global"]
 command = ["bin/herdr-drawer", "setup"]
 
+[[actions]]
+id = "cleanup-workspace"
+title = "Cleanup utility sessions in current workspace"
+contexts = ["global"]
+command = ["bin/herdr-drawer", "cleanup", "--scope", "workspace"]
+
+[[actions]]
+id = "cleanup-all"
+title = "Cleanup all utility sessions"
+contexts = ["global"]
+command = ["bin/herdr-drawer", "cleanup", "--scope", "all"]
+
 [[panes]]
 id = "drawer"
 title = "Drawer"
