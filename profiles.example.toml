@@ -1,14 +1,18 @@
+# Copy to: ~/.config/herdr/plugins/config/herdr-drawer/profiles.toml
+
 default_profile = "default"
 
+# 1. Persistent bottom terminal drawer anchored beneath Neovim (or the active pane)
 [profiles.default]
-placement = "down"
-scope = "anchor"
-size_ratio = 0.30
-persist_on_hide = true
-show_command_text = false
-anchor_policy = "app_in_tab_or_tab_scope"
-anchor_app_match = ["nvim", "vim"]
+placement = "down"                        # down | up | left | right
+scope = "anchor"                          # anchor | tab
+size_ratio = 0.30                         # 0.10..0.90 (fraction of split used by utility pane)
+persist_on_hide = true                    # keep shell sessions alive when hidden
+show_command_text = false                 # launch startup command without echoing command line
+anchor_policy = "app_in_tab_or_tab_scope" # generic_non_plugin | app_in_tab_or_tab_scope
+anchor_app_match = ["nvim", "vim"]        # match foreground editor process when using app_in_tab_or_tab_scope
 
+# 2. Full-height right-hand Cursor Agent sidecar spanning the tab root
 [profiles.cursorRight]
 placement = "right"
 scope = "tab"
@@ -17,11 +21,20 @@ persist_on_hide = true
 show_command_text = false
 command = "cursor agent"
 
-[profiles.opencodeLeft]
-placement = "left"
-scope = "anchor"
+# 3. AI coding sidecar with working-directory interpolation ({{cwd}} or ${cwd})
+[profiles.opencodeRight]
+placement = "right"
+scope = "tab"
 size_ratio = 0.35
-persist_on_hide = false
+persist_on_hide = true
 show_command_text = false
-anchor_policy = "generic_non_plugin"
-command = "opencode --project {{cwd}}"
+command = "opencode {{cwd}}"
+
+# 4. Ephemeral test / task runner that starts fresh on every open
+[profiles.testRunner]
+placement = "down"
+scope = "anchor"
+size_ratio = 0.25
+persist_on_hide = false
+show_command_text = true
+command = "go test ./..."

@@ -231,6 +231,10 @@ func listDaemonSessions() []string {
 	return resp.Sessions
 }
 
+func shutdownDaemon() {
+	_ = callDaemon(sessionHandshake{Type: "shutdown"}, nil)
+}
+
 func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
 	return ensureSessionHostWithCommand(sessionID, cwd, rows, cols, "", false)
 }
@@ -480,11 +484,16 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 	}
 
 	var cmd *exec.Cmd
-	if strings.TrimSpace(initCommand) != "" && !showCommand {
-		if argv, err := shlex.Split(initCommand); err == nil && len(argv) > 0 {
-			cmd = exec.Command(argv[0], argv[1:]...)
+	trimmedCmd := strings.TrimSpace(initCommand)
+	if trimmedCmd != "" && !showCommand {
+		if argv, err := shlex.Split(trimmedCmd); err == nil && len(argv) > 0 && !strings.ContainsAny(trimmedCmd, "|&;<>()$`") {
+			if resolved, lookErr := exec.LookPath(argv[0]); lookErr == nil {
+				cmd = exec.Command(resolved, argv[1:]...)
+			} else {
+				cmd = exec.Command(shell, "-lc", "exec "+trimmedCmd)
+			}
 		} else {
-			cmd = exec.Command(shell, "-lc", initCommand)
+			cmd = exec.Command(shell, "-lc", trimmedCmd)
 		}
 	} else {
 		cmd = exec.Command(shell, "-l")
@@ -563,8 +572,8 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 		}
 	}()
 
-	if strings.TrimSpace(initCommand) != "" {
-		_, _ = master.Write([]byte(initCommand + "\n"))
+	if trimmedCmd != "" && showCommand {
+		_, _ = master.Write([]byte(trimmedCmd + "\n"))
 	}
 
 	return sess, nil
@@ -644,6 +653,11 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		resp, _ := json.Marshal(map[string][]string{"sessions": ids})
 		_, _ = c.Write(append(resp, '\n'))
 		_ = c.Close()
+
+	case "shutdown":
+		_, _ = c.Write([]byte(`{"ok":true}` + "\n"))
+		_ = c.Close()
+		d.shutdown()
 
 	case "attach":
 		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, "", false)
@@ -893,7 +907,16 @@ func shouldKeepSessionAliveWithSnapshot(sessionID string, attached bool, panes [
 		termToTab[p.TerminalID] = p.TabID
 	}
 
-	for tabID, ts := range sf.Tabs {
+	for stateID, ts := range sf.Tabs {
+		if ts == nil {
+			continue
+		}
+		tabID := ts.TabID
+		if tabID == "" {
+			if parts := strings.SplitN(stateID, "::", 2); len(parts) > 0 {
+				tabID = parts[0]
+			}
+		}
 		sessions := map[string]bool{}
 		collectDrawerSessions(ts.Tree, sessions)
 		for _, s := range ts.TermToSession {
@@ -916,10 +939,7 @@ func shouldKeepSessionAliveWithSnapshot(sessionID string, attached bool, panes [
 					return true
 				}
 			}
-			// A visible profile can transiently lose pane mappings during hide/close
-			// state transitions before the state file is persisted. Keep the session
-			// alive; gcOrphanedDrawers will clean up true orphans on the next action.
-			return true
+			return false
 		}
 		return true
 	}
