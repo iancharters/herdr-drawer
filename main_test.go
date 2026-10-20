@@ -62,7 +62,7 @@ func TestFindDrawerSplitAndSnapshot(t *testing.T) {
 		"term_d2": "s-222",
 	}
 
-	split := findDrawerSplit(root, "w4:p1", paneToTerm, termToSession, false)
+	split := findDrawerSplit(root, "w4:p1", paneToTerm, termToSession, "down", false)
 	if split == nil {
 		t.Fatalf("expected to find drawer split")
 	}
@@ -92,6 +92,46 @@ func TestFindDrawerSplitAndSnapshot(t *testing.T) {
 	sib := findSiblingSessionID(split.Second, "w4:p6", paneToTerm, termToSession)
 	if sib != "s-111" {
 		t.Fatalf("expected sibling session s-111 for w4:p6, got %q", sib)
+	}
+}
+
+func TestFindDrawerSplitLeftPlacement(t *testing.T) {
+	root := &LayoutNode{
+		Type:      "split",
+		Direction: "right",
+		Ratio:     0.3,
+		First: &LayoutNode{
+			Type:   "pane",
+			PaneID: "w1:pU",
+		},
+		Second: &LayoutNode{
+			Type:   "pane",
+			PaneID: "w1:pA",
+		},
+	}
+	paneToTerm := map[string]string{
+		"w1:pU": "term_u",
+		"w1:pA": "term_a",
+	}
+	termToSession := map[string]string{
+		"term_u": "s-utility",
+	}
+	split := findDrawerSplit(root, "w1:pA", paneToTerm, termToSession, "left", false)
+	if split == nil {
+		t.Fatalf("expected left-placement split to be found")
+	}
+	utility, anchor := splitBranch(split, normalizePlacement("left").utilityOnFirst)
+	if !layoutContainsPane(utility, "w1:pU") || !layoutContainsPane(anchor, "w1:pA") {
+		t.Fatalf("unexpected left split branches")
+	}
+}
+
+func TestSplitRatioForPlacement(t *testing.T) {
+	if got := splitRatioForPlacement(0.30, "down"); got != 0.70 {
+		t.Fatalf("down ratio mismatch: got %v", got)
+	}
+	if got := splitRatioForPlacement(0.30, "left"); got != 0.30 {
+		t.Fatalf("left ratio mismatch: got %v", got)
 	}
 }
 
@@ -275,5 +315,3 @@ func TestRunSetupInteractiveDefaultAndOverride(t *testing.T) {
 		t.Fatalf("expected custom config at %s: %v", customPath, err)
 	}
 }
-
-

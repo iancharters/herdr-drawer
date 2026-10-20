@@ -80,6 +80,7 @@ type sessionHandshake struct {
 	Term      string `json:"term,omitempty"`
 	Rows      uint16 `json:"rows,omitempty"`
 	Cols      uint16 `json:"cols,omitempty"`
+	Command   string `json:"command,omitempty"`
 }
 
 func daemonSocketPath() string {
@@ -228,6 +229,10 @@ func listDaemonSessions() []string {
 }
 
 func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
+	return ensureSessionHostWithCommand(sessionID, cwd, rows, cols, "")
+}
+
+func ensureSessionHostWithCommand(sessionID, cwd string, rows, cols uint16, command string) error {
 	if sessionID == "" {
 		return errors.New("missing session ID")
 	}
@@ -245,6 +250,7 @@ func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
 		Term:      os.Getenv("TERM"),
 		Rows:      rows,
 		Cols:      cols,
+		Command:   command,
 	}, &resp); err != nil {
 		return err
 	}
@@ -430,7 +436,7 @@ func sanitizeShellEnv(requestedTerm string) []string {
 	return env
 }
 
-func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16) (*ptySession, error) {
+func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16, initCommand string) (*ptySession, error) {
 	if sessionID == "" {
 		return nil, errors.New("missing session ID")
 	}
@@ -544,6 +550,10 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 		}
 	}()
 
+	if strings.TrimSpace(initCommand) != "" {
+		_, _ = master.Write([]byte(initCommand + "\n"))
+	}
+
 	return sess, nil
 }
 
@@ -566,7 +576,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "ensure":
-		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols)
+		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, hs.Command)
 		if err != nil {
 			resp, _ := json.Marshal(map[string]any{"alive": false, "error": err.Error()})
 			_, _ = c.Write(append(resp, '\n'))
@@ -623,7 +633,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "attach":
-		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols)
+		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, "")
 		if err != nil {
 			_ = c.Close()
 			return

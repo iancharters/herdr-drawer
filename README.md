@@ -53,6 +53,8 @@ command = "herdr-drawer.toggle"
 description = "toggle terminal drawer"
 ```
 
+This remains the default behavior out of the box. Without any profile config, `herdr-drawer` opens a bottom drawer and preserves terminal state across hide/show.
+
 *(Optional)* You can also bind dedicated shortcuts to split panes inside the drawer, or simply use your existing `herdr` split keybindings (`prefix+s`, `prefix+v`, etc.):
 
 ```toml
@@ -70,6 +72,63 @@ description = "split terminal drawer down"
 ```
 
 Reload `herdr`'s configuration (`prefix+shift+r`) after saving `config.toml`.
+
+### 2.1 Optional: profile-driven utility panes
+
+You can define named profiles in:
+
+```text
+~/.config/herdr/plugins/config/herdr-drawer/profiles.toml
+```
+
+Example:
+
+```toml
+default_profile = "default"
+
+[profiles.default]
+placement = "down"        # down|up|left|right
+size_ratio = 0.30         # percent of screen used by utility pane
+persist_on_hide = true    # true = hide/unhide; false = restart on next open
+
+[profiles.cursorRight]
+placement = "right"
+size_ratio = 0.35
+persist_on_hide = true
+command = "cursor agent --cwd {{cwd}}"
+
+[profiles.opencodeLeft]
+placement = "left"
+size_ratio = 0.35
+persist_on_hide = false
+command = "opencode --project {{cwd}}"
+```
+
+`command` runs only when a new session is created for that profile. `{{cwd}}` (or `${cwd}`) is replaced with the anchor pane cwd.
+
+Bind arbitrary keys to specific profiles:
+
+```toml
+[[keys.command]]
+key = "ctrl+alt+/"
+type = "shell"
+command = "/absolute/path/to/herdr-drawer/bin/herdr-drawer toggle --profile default"
+description = "toggle default drawer profile"
+
+[[keys.command]]
+key = "prefix+alt+c"
+type = "shell"
+command = "\"$HERDR_DRAWER_BIN\" toggle --profile cursorRight"
+description = "toggle cursor utility pane"
+
+[[keys.command]]
+key = "prefix+alt+o"
+type = "shell"
+command = "\"$HERDR_DRAWER_BIN\" toggle --profile opencodeLeft"
+description = "toggle opencode utility pane"
+```
+
+If you do not set `HERDR_DRAWER_BIN`, use the absolute path to `bin/herdr-drawer` in your installed plugin directory.
 
 ### 3. Configure Neovim
 

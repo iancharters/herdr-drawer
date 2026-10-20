@@ -20,7 +20,7 @@ import (
 const (
 	pluginID           = "herdr-drawer"
 	drawerEntrypointID = "drawer"
-	defaultDrawerRatio = 0.70
+	defaultUtilitySize = 0.30
 )
 
 type RPCClient struct {
@@ -94,10 +94,12 @@ type DrawerNode struct {
 }
 
 type TabDrawerState struct {
+	ProfileID        string            `json:"profile_id,omitempty"`
 	TabID            string            `json:"tab_id"`
 	WorkspaceID      string            `json:"workspace_id"`
 	AnchorTerminalID string            `json:"anchor_terminal_id"`
-	DrawerRatio      float64           `json:"drawer_ratio"`
+	UtilityRatio     float64           `json:"utility_ratio,omitempty"`
+	DrawerRatio      float64           `json:"drawer_ratio,omitempty"` // legacy: anchor ratio
 	Visible          bool              `json:"visible"`
 	FocusedSessionID string            `json:"focused_session_id"`
 	TermToSession    map[string]string `json:"term_to_session"`
@@ -106,6 +108,88 @@ type TabDrawerState struct {
 
 type StateFile struct {
 	Tabs map[string]*TabDrawerState `json:"tabs"`
+}
+
+type placementSpec struct {
+	layoutDirection string
+	utilityOnFirst  bool
+}
+
+func stateKey(tabID, profileID string) string {
+	if strings.TrimSpace(profileID) == "" {
+		profileID = defaultProfileName
+	}
+	return tabID + "::" + profileID
+}
+
+func normalizeUtilityRatio(ts *TabDrawerState) {
+	if ts == nil {
+		return
+	}
+	if ts.UtilityRatio >= 0.1 && ts.UtilityRatio <= 0.9 {
+		return
+	}
+	legacy := ts.DrawerRatio
+	if legacy >= 0.1 && legacy <= 0.9 {
+		u := 1.0 - legacy
+		if u >= 0.1 && u <= 0.9 {
+			ts.UtilityRatio = u
+			return
+		}
+	}
+	ts.UtilityRatio = defaultUtilitySize
+}
+
+func normalizeStateFile(sf *StateFile) {
+	if sf == nil {
+		return
+	}
+	if sf.Tabs == nil {
+		sf.Tabs = map[string]*TabDrawerState{}
+	}
+	normalized := make(map[string]*TabDrawerState, len(sf.Tabs))
+	for key, ts := range sf.Tabs {
+		if ts == nil {
+			continue
+		}
+		if ts.ProfileID == "" {
+			ts.ProfileID = defaultProfileName
+		}
+		if ts.TabID == "" {
+			if parts := strings.SplitN(key, "::", 2); len(parts) > 0 {
+				ts.TabID = parts[0]
+			} else {
+				ts.TabID = key
+			}
+		}
+		normalizeUtilityRatio(ts)
+		normalized[stateKey(ts.TabID, ts.ProfileID)] = ts
+	}
+	sf.Tabs = normalized
+}
+
+func normalizePlacement(dir string) placementSpec {
+	switch strings.ToLower(strings.TrimSpace(dir)) {
+	case "up":
+		return placementSpec{layoutDirection: "down", utilityOnFirst: true}
+	case "left":
+		return placementSpec{layoutDirection: "right", utilityOnFirst: true}
+	case "right":
+		return placementSpec{layoutDirection: "right", utilityOnFirst: false}
+	default:
+		return placementSpec{layoutDirection: "down", utilityOnFirst: false}
+	}
+}
+
+func splitRatioForPlacement(size float64, placement string) float64 {
+	if size < 0.1 || size > 0.9 {
+		size = defaultUtilitySize
+	}
+	spec := normalizePlacement(placement)
+	if spec.utilityOnFirst {
+		return size
+	}
+	return 1.0 - size
 }
 
 func resolveSocketPath() (string, error) {
@@ -178,6 +262,16 @@ func (c *RPCClient) ListPanes() ([]PaneInfo, error) {
 	return res.Panes, nil
 }
 
+func (c *RPCClient) GetPane(paneID string) (*PaneInfo, error) {
+	var res struct {
+		Pane PaneInfo `json:"pane"`
+	}
+	if err := c.Call("pane.get", map[string]interface{}{"pane_id": paneID}, &res); err != nil {
+		return nil, err
+	}
+	return &res.Pane, nil
+}
+
 func (c *RPCClient) ExportLayout(tabID string) (*LayoutExport, error) {
 	var res struct {
 		Layout LayoutExport `json:"layout"`
@@ -245,6 +339,13 @@ func (c *RPCClient) FocusPane(paneID string) error {
 	return c.Call("pane.focus", map[string]interface{}{"pane_id": paneID}, nil)
 }
 
+func (c *RPCClient) SwapPanes(sourcePaneID, targetPaneID string) error {
+	return c.Call("pane.swap", map[string]interface{}{
+		"source_pane_id": sourcePaneID,
+		"target_pane_id": targetPaneID,
+	}, nil)
+}
+
 func baseStateDir() string {
 	if d := os.Getenv("HERDR_DRAWER_STATE_DIR"); d != "" {
 		return d
@@ -290,10 +391,8 @@ func withStateLock(fn func(*StateFile) error) error {
 	sf := &StateFile{Tabs: map[string]*TabDrawerState{}}
 	if data, err := os.ReadFile(statePath); err == nil && len(data) > 0 {
 		_ = json.Unmarshal(data, sf)
-		if sf.Tabs == nil {
-			sf.Tabs = map[string]*TabDrawerState{}
-		}
 	}
+	normalizeStateFile(sf)
 
 	if err := fn(sf); err != nil {
 		return err
@@ -333,6 +432,7 @@ func readStateSnapshot() (*StateFile, error) {
 	if err := json.Unmarshal(data, sf); err != nil {
 		return nil, err
 	}
+	normalizeStateFile(sf)
 	return sf, nil
 }
 
@@ -409,18 +509,33 @@ func layoutContainsAnyTerm(node *LayoutNode, paneToTerm map[string]string, termT
 	return layoutContainsAnyTerm(node.First, paneToTerm, termToSession) || layoutContainsAnyTerm(node.Second, paneToTerm, termToSession)
 }
 
-func findDrawerSplit(root *LayoutNode, anchorPaneID string, paneToTerm map[string]string, termToSession map[string]string, allowFallback bool) *LayoutNode {
+func splitBranch(split *LayoutNode, utilityOnFirst bool) (utility *LayoutNode, anchor *LayoutNode) {
+	if split == nil {
+		return nil, nil
+	}
+	if utilityOnFirst {
+		return split.First, split.Second
+	}
+	return split.Second, split.First
+}
+
+func findDrawerSplit(root *LayoutNode, anchorPaneID string, paneToTerm map[string]string, termToSession map[string]string, placement string, allowFallback bool) *LayoutNode {
 	if root == nil || root.Type != "split" {
 		return nil
 	}
-	if found := findDrawerSplit(root.First, anchorPaneID, paneToTerm, termToSession, allowFallback); found != nil {
+	if found := findDrawerSplit(root.First, anchorPaneID, paneToTerm, termToSession, placement, allowFallback); found != nil {
 		return found
 	}
-	if found := findDrawerSplit(root.Second, anchorPaneID, paneToTerm, termToSession, allowFallback); found != nil {
+	if found := findDrawerSplit(root.Second, anchorPaneID, paneToTerm, termToSession, placement, allowFallback); found != nil {
 		return found
 	}
-	if root.Direction == "down" && layoutContainsPane(root.First, anchorPaneID) {
-		if layoutContainsAnyTerm(root.Second, paneToTerm, termToSession) || allowFallback {
+	spec := normalizePlacement(placement)
+	if root.Direction != spec.layoutDirection {
+		return nil
+	}
+	utilityBranch, anchorBranch := splitBranch(root, spec.utilityOnFirst)
+	if layoutContainsPane(anchorBranch, anchorPaneID) {
+		if layoutContainsAnyTerm(utilityBranch, paneToTerm, termToSession) || allowFallback {
 			return root
 		}
 	}
@@ -641,14 +756,6 @@ func adoptNativeDrawerSplits(tabID string) error {
 	client := &RPCClient{socketPath: sock}
 
 	return withStateLock(func(sf *StateFile) error {
-		ts, ok := sf.Tabs[tabID]
-		if !ok || !ts.Visible || ts.AnchorTerminalID == "" {
-			return nil
-		}
-		if ts.TermToSession == nil {
-			ts.TermToSession = map[string]string{}
-		}
-
 		panes, err := client.ListPanes()
 		if err != nil {
 			return err
@@ -662,69 +769,83 @@ func adoptNativeDrawerSplits(tabID string) error {
 			termToPane[p.TerminalID] = p
 		}
 
-		anchorPane, ok := termToPane[ts.AnchorTerminalID]
-		if !ok || anchorPane.TabID != tabID {
-			return nil
-		}
-
 		layout, err := client.ExportLayout(tabID)
 		if err != nil {
 			return err
 		}
-
-		drawerSplit := findDrawerSplit(&layout.Root, anchorPane.PaneID, paneToTerm, ts.TermToSession, false)
-		if drawerSplit == nil {
-			return nil
-		}
-
-		drawerPaneIDs := collectLayoutPaneIDs(drawerSplit.Second)
-		adoptedAny := false
-		for _, paneID := range drawerPaneIDs {
-			p, ok := paneByID[paneID]
-			if !ok || p.TerminalID == "" || ts.TermToSession[p.TerminalID] != "" {
+		for _, ts := range sf.Tabs {
+			if ts == nil || ts.TabID != tabID || !ts.Visible || ts.AnchorTerminalID == "" {
 				continue
 			}
-
-			cwd := ""
-			if sibSess := findSiblingSessionID(drawerSplit.Second, p.PaneID, paneToTerm, ts.TermToSession); sibSess != "" {
-				cwd = sessionCwd(sibSess)
+			if ts.TermToSession == nil {
+				ts.TermToSession = map[string]string{}
 			}
-			if cwd == "" && ts.FocusedSessionID != "" {
-				cwd = sessionCwd(ts.FocusedSessionID)
-			}
-			if cwd == "" {
-				cwd = p.ForegroundCwd
-			}
-			if cwd == "" {
-				cwd = p.Cwd
-			}
-
-			newSessID := newSessionID()
-			_ = ensureSessionHost(newSessID, cwd, 24, 80)
-			newPane, err := client.OpenPluginSplitPane(p.PaneID, "right", cwd, newSessID, p.Focused)
-			if err != nil {
-				killSession(newSessID)
+			anchorPane, ok := termToPane[ts.AnchorTerminalID]
+			if !ok || anchorPane.TabID != tabID {
 				continue
 			}
-			_ = client.ClosePane(p.PaneID)
-			if p.Focused {
-				_ = client.FocusPane(newPane.PaneID)
-				ts.FocusedSessionID = newSessID
+			placement := "down"
+			if ts.ProfileID != "" {
+				if cfg, err := loadProfilesFile(); err == nil {
+					placement = resolveProfile(ts.ProfileID, cfg).Placement
+				}
 			}
 
-			ts.TermToSession[newPane.TerminalID] = newSessID
-			paneByID[newPane.PaneID] = *newPane
-			paneToTerm[newPane.PaneID] = newPane.TerminalID
-			delete(paneByID, p.PaneID)
-			delete(paneToTerm, p.PaneID)
-			adoptedAny = true
-		}
+			drawerSplit := findDrawerSplit(&layout.Root, anchorPane.PaneID, paneToTerm, ts.TermToSession, placement, false)
+			if drawerSplit == nil {
+				continue
+			}
+			utilitySubtree, _ := splitBranch(drawerSplit, normalizePlacement(placement).utilityOnFirst)
+			drawerPaneIDs := collectLayoutPaneIDs(utilitySubtree)
+			adoptedAny := false
+			for _, paneID := range drawerPaneIDs {
+				p, ok := paneByID[paneID]
+				if !ok || p.TerminalID == "" || ts.TermToSession[p.TerminalID] != "" {
+					continue
+				}
 
-		if adoptedAny {
-			if updatedLayout, err := client.ExportLayout(tabID); err == nil {
-				if updatedSplit := findDrawerSplit(&updatedLayout.Root, anchorPane.PaneID, paneToTerm, ts.TermToSession, false); updatedSplit != nil {
-					if updatedTree := layoutToDrawerTree(updatedSplit.Second, paneByID, ts.TermToSession); updatedTree != nil {
-						ts.Tree = updatedTree
+				cwd := ""
+				if sibSess := findSiblingSessionID(utilitySubtree, p.PaneID, paneToTerm, ts.TermToSession); sibSess != "" {
+					cwd = sessionCwd(sibSess)
+				}
+				if cwd == "" && ts.FocusedSessionID != "" {
+					cwd = sessionCwd(ts.FocusedSessionID)
+				}
+				if cwd == "" {
+					cwd = p.ForegroundCwd
+				}
+				if cwd == "" {
+					cwd = p.Cwd
+				}
+
+				newSessID := newSessionID()
+				_ = ensureSessionHost(newSessID, cwd, 24, 80)
+				newPane, err := openDrawerPaneWithRatio(client, tabID, p.PaneID, "right", 0.5, newSessID, cwd, "", p.Focused)
+				if err != nil {
+					killSession(newSessID)
+					continue
+				}
+				_ = client.ClosePane(p.PaneID)
+				if p.Focused {
+					_ = client.FocusPane(newPane.PaneID)
+					ts.FocusedSessionID = newSessID
+				}
+
+				ts.TermToSession[newPane.TerminalID] = newSessID
+				paneByID[newPane.PaneID] = *newPane
+				paneToTerm[newPane.PaneID] = newPane.TerminalID
+				delete(paneByID, p.PaneID)
+				delete(paneToTerm, p.PaneID)
+				adoptedAny = true
+			}
+
+			if adoptedAny {
+				if updatedLayout, err := client.ExportLayout(tabID); err == nil {
+					if updatedSplit := findDrawerSplit(&updatedLayout.Root, anchorPane.PaneID, paneToTerm, ts.TermToSession, placement, false); updatedSplit != nil {
+						updatedSubtree, _ := splitBranch(updatedSplit, normalizePlacement(placement).utilityOnFirst)
+						if updatedTree := layoutToDrawerTree(updatedSubtree, paneByID, ts.TermToSession); updatedTree != nil {
+							ts.Tree = updatedTree
+						}
 					}
 				}
 			}
@@ -733,17 +854,26 @@ func adoptNativeDrawerSplits(tabID string) error {
 	})
 }
 
-func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, direction string, ratio float64, sessionID, cwd string, focus bool) (*PaneInfo, error) {
-	_ = ensureSessionHost(sessionID, cwd, 24, 80)
-	pane, err := client.OpenPluginSplitPane(targetPaneID, direction, cwd, sessionID, focus)
+func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, placement string, ratio float64, sessionID, cwd, command string, focus bool) (*PaneInfo, error) {
+	_ = ensureSessionHostWithCommand(sessionID, cwd, 24, 80, command)
+	spec := normalizePlacement(placement)
+	pane, err := client.OpenPluginSplitPane(targetPaneID, spec.layoutDirection, cwd, sessionID, focus)
 	if err != nil {
 		return nil, err
+	}
+	if spec.utilityOnFirst {
+		_ = client.SwapPanes(targetPaneID, pane.PaneID)
 	}
 	if ratio >= 0.1 && ratio <= 0.9 && math.Abs(ratio-0.5) > 0.005 {
 		if layout, err := client.ExportLayout(tabID); err == nil {
 			if path, ok := findSplitPath(&layout.Root, targetPaneID, pane.PaneID, nil); ok {
 				_ = client.SetSplitRatio(tabID, path, ratio)
 			}
+		}
+	}
+	if focus {
+		if updated, err := client.GetPane(pane.PaneID); err == nil && updated != nil {
+			return updated, nil
 		}
 	}
 	return pane, nil
@@ -770,7 +900,7 @@ func reconstructSplitsPreOrder(client *RPCClient, tabID string, node *DrawerNode
 	if dir != "right" && dir != "down" {
 		dir = "right"
 	}
-	newPane, err := openDrawerPaneWithRatio(client, tabID, targetPane.PaneID, dir, ratio, rightLeaf.SessionID, rightLeaf.Cwd, false)
+	newPane, err := openDrawerPaneWithRatio(client, tabID, targetPane.PaneID, dir, ratio, rightLeaf.SessionID, rightLeaf.Cwd, "", false)
 	if err != nil {
 		return err
 	}
@@ -815,7 +945,12 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 		activeTabs[p.TabID] = true
 	}
 	referencedSessions := map[string]bool{}
-	for tabID, ts := range sf.Tabs {
+	for stateID, ts := range sf.Tabs {
+		if ts == nil {
+			delete(sf.Tabs, stateID)
+			continue
+		}
+		tabID := ts.TabID
 		anchorPane, anchorAlive := termToPane[ts.AnchorTerminalID]
 		if !activeTabs[tabID] || (ts.AnchorTerminalID != "" && (!anchorAlive || anchorPane.TabID != tabID)) {
 			sessions := map[string]bool{}
@@ -831,7 +966,7 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 			for sessID := range sessions {
 				killSession(sessID)
 			}
-			delete(sf.Tabs, tabID)
+			delete(sf.Tabs, stateID)
 			continue
 		}
 
@@ -861,9 +996,10 @@ func gcOrphanedDrawers(client *RPCClient, sf *StateFile, panes []PaneInfo, termT
 	}
 }
 
-func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, drawerSplit *LayoutNode, currentPane *PaneInfo, paneByID map[string]PaneInfo, paneToTerm map[string]string, termToPane map[string]PaneInfo) error {
-	ensureDrawerSubtreeSessions(drawerSplit.Second, paneByID, ts.TermToSession)
-	tree := layoutToDrawerTree(drawerSplit.Second, paneByID, ts.TermToSession)
+func hideDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile, layout *LayoutExport, drawerSplit *LayoutNode, currentPane *PaneInfo, paneByID map[string]PaneInfo, paneToTerm map[string]string, termToPane map[string]PaneInfo) error {
+	utilitySubtree, anchorSubtree := splitBranch(drawerSplit, normalizePlacement(profile.Placement).utilityOnFirst)
+	ensureDrawerSubtreeSessions(utilitySubtree, paneByID, ts.TermToSession)
+	tree := layoutToDrawerTree(utilitySubtree, paneByID, ts.TermToSession)
 	if tree == nil {
 		return errors.New("drawer split had no valid panes")
 	}
@@ -884,7 +1020,7 @@ func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, dra
 		}
 	}
 
-	ts.DrawerRatio = drawerSplit.Ratio
+	ts.UtilityRatio = profile.SizeRatio
 	ts.Tree = tree
 	ts.Visible = false
 
@@ -907,23 +1043,31 @@ func hideDrawer(client *RPCClient, ts *TabDrawerState, layout *LayoutExport, dra
 	var focusPaneID string
 	if anchorPane, ok := termToPane[ts.AnchorTerminalID]; ok && anchorPane.TabID == ts.TabID {
 		focusPaneID = anchorPane.PaneID
-	} else if drawerSplit.First != nil {
-		focusPaneID = firstLayoutPaneID(drawerSplit.First)
+	} else if anchorSubtree != nil {
+		focusPaneID = firstLayoutPaneID(anchorSubtree)
 	}
 	if focusPaneID != "" {
 		_ = client.FocusPane(focusPaneID)
 	}
 
-	drawerPaneIDs := collectLayoutPaneIDs(drawerSplit.Second)
+	drawerPaneIDs := collectLayoutPaneIDs(utilitySubtree)
 	for _, paneID := range drawerPaneIDs {
 		_ = client.ClosePane(paneID)
+	}
+
+	if !profile.PersistOnHide {
+		for sessID := range knownSessions {
+			killSession(sessID)
+		}
+		ts.Tree = nil
+		ts.FocusedSessionID = ""
 	}
 	ts.TermToSession = map[string]string{}
 
 	return nil
 }
 
-func showDrawer(client *RPCClient, ts *TabDrawerState, currentPane *PaneInfo, explicitCwd string, termToPane map[string]PaneInfo) error {
+func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile, currentPane *PaneInfo, explicitCwd string, termToPane map[string]PaneInfo) error {
 	anchorPane := *currentPane
 	if ts.AnchorTerminalID != "" {
 		if p, ok := termToPane[ts.AnchorTerminalID]; ok && p.TabID == currentPane.TabID {
@@ -933,16 +1077,20 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, currentPane *PaneInfo, ex
 	ts.AnchorTerminalID = anchorPane.TerminalID
 	ts.TabID = anchorPane.TabID
 	ts.WorkspaceID = anchorPane.WorkspaceID
-	if ts.DrawerRatio < 0.1 || ts.DrawerRatio > 0.9 {
-		ts.DrawerRatio = defaultDrawerRatio
-	}
+	ts.UtilityRatio = profile.SizeRatio
 	ts.TermToSession = map[string]string{}
 
-	prunedTree := pruneDrawerTree(ts.Tree, isSessionAlive)
+	prunedTree := ts.Tree
+	if profile.PersistOnHide {
+		prunedTree = pruneDrawerTree(ts.Tree, isSessionAlive)
+	} else {
+		prunedTree = nil
+	}
 	if prunedTree == nil {
 		cwd := resolveAnchorCwd(client, anchorPane, explicitCwd)
 		sessionID := newSessionID()
-		newPane, err := openDrawerPaneWithRatio(client, anchorPane.TabID, anchorPane.PaneID, "down", ts.DrawerRatio, sessionID, cwd, true)
+		command := renderProfileCommand(profile.Command, cwd)
+		newPane, err := openDrawerPaneWithRatio(client, anchorPane.TabID, anchorPane.PaneID, profile.Placement, splitRatioForPlacement(profile.SizeRatio, profile.Placement), sessionID, cwd, command, true)
 		if err != nil {
 			return err
 		}
@@ -965,7 +1113,7 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, currentPane *PaneInfo, ex
 		rootLeaf.Cwd = resolveAnchorCwd(client, anchorPane, explicitCwd)
 	}
 
-	rootPane, err := openDrawerPaneWithRatio(client, ts.TabID, anchorPane.PaneID, "down", ts.DrawerRatio, rootLeaf.SessionID, rootLeaf.Cwd, false)
+	rootPane, err := openDrawerPaneWithRatio(client, ts.TabID, anchorPane.PaneID, profile.Placement, splitRatioForPlacement(profile.SizeRatio, profile.Placement), rootLeaf.SessionID, rootLeaf.Cwd, "", false)
 	if err != nil {
 		return err
 	}
@@ -996,12 +1144,18 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, currentPane *PaneInfo, ex
 	return nil
 }
 
-func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
+func runAction(action, explicitPaneID, explicitCwd, splitDir, profileName string) error {
 	sock, err := resolveSocketPath()
 	if err != nil {
 		return err
 	}
 	client := &RPCClient{socketPath: sock}
+	profiles, err := loadProfilesFile()
+	if err != nil {
+		return fmt.Errorf("load profiles: %w", err)
+	}
+	profileName = profileNameFromFlagOrDefault(profileName, profiles)
+	profile := resolveProfile(profileName, profiles)
 
 	if explicitPaneID != "" && explicitCwd != "" {
 		_ = writeSyncedCwd(explicitPaneID, explicitCwd)
@@ -1033,19 +1187,22 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
 		}
 
 		tabID := currentPane.TabID
-		ts, ok := sf.Tabs[tabID]
+		key := stateKey(tabID, profile.Name)
+		ts, ok := sf.Tabs[key]
 		if !ok {
 			ts = &TabDrawerState{
+				ProfileID:     profile.Name,
 				TabID:         tabID,
 				WorkspaceID:   currentPane.WorkspaceID,
-				DrawerRatio:   defaultDrawerRatio,
+				UtilityRatio:  profile.SizeRatio,
 				TermToSession: map[string]string{},
 			}
-			sf.Tabs[tabID] = ts
+			sf.Tabs[key] = ts
 		}
 		if ts.TermToSession == nil {
 			ts.TermToSession = map[string]string{}
 		}
+		ts.ProfileID = profile.Name
 
 		layout, err := client.ExportLayout(tabID)
 		if err != nil {
@@ -1061,21 +1218,22 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
 
 		var drawerSplit *LayoutNode
 		if anchorPaneID != "" {
-			drawerSplit = findDrawerSplit(&layout.Root, anchorPaneID, paneToTerm, ts.TermToSession, false)
+			drawerSplit = findDrawerSplit(&layout.Root, anchorPaneID, paneToTerm, ts.TermToSession, profile.Placement, false)
 		}
 		isCurrentlyVisible := drawerSplit != nil
+		utilitySubtree, _ := splitBranch(drawerSplit, normalizePlacement(profile.Placement).utilityOnFirst)
 
 		switch action {
 		case "toggle":
 			if isCurrentlyVisible {
-				return hideDrawer(client, ts, layout, drawerSplit, currentPane, paneByID, paneToTerm, termToPane)
+				return hideDrawer(client, ts, profile, layout, drawerSplit, currentPane, paneByID, paneToTerm, termToPane)
 			}
 			ts.Visible = false
-			return showDrawer(client, ts, currentPane, explicitCwd, termToPane)
+			return showDrawer(client, ts, profile, currentPane, explicitCwd, termToPane)
 
 		case "open":
 			if isCurrentlyVisible {
-				tree := layoutToDrawerTree(drawerSplit.Second, paneByID, ts.TermToSession)
+				tree := layoutToDrawerTree(utilitySubtree, paneByID, ts.TermToSession)
 				knownSessions := map[string]bool{}
 				collectDrawerSessions(tree, knownSessions)
 				targetSess := ts.FocusedSessionID
@@ -1092,20 +1250,20 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
 				return nil
 			}
 			ts.Visible = false
-			return showDrawer(client, ts, currentPane, explicitCwd, termToPane)
+			return showDrawer(client, ts, profile, currentPane, explicitCwd, termToPane)
 
 		case "close":
 			if !isCurrentlyVisible {
 				ts.Visible = false
 				return nil
 			}
-			return hideDrawer(client, ts, layout, drawerSplit, currentPane, paneByID, paneToTerm, termToPane)
+			return hideDrawer(client, ts, profile, layout, drawerSplit, currentPane, paneByID, paneToTerm, termToPane)
 
 		case "split":
 			if !isCurrentlyVisible {
-				return showDrawer(client, ts, currentPane, explicitCwd, termToPane)
+				return showDrawer(client, ts, profile, currentPane, explicitCwd, termToPane)
 			}
-			tree := layoutToDrawerTree(drawerSplit.Second, paneByID, ts.TermToSession)
+			tree := layoutToDrawerTree(utilitySubtree, paneByID, ts.TermToSession)
 			knownSessions := map[string]bool{}
 			collectDrawerSessions(tree, knownSessions)
 
@@ -1137,17 +1295,18 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir string) error {
 				splitDir = "right"
 			}
 			newSessID := newSessionID()
-			newPane, err := openDrawerPaneWithRatio(client, tabID, targetSplitPane.PaneID, splitDir, 0.5, newSessID, cwd, true)
+			newPane, err := openDrawerPaneWithRatio(client, tabID, targetSplitPane.PaneID, splitDir, 0.5, newSessID, cwd, "", true)
 			if err != nil {
 				return err
 			}
 			ts.TermToSession[newPane.TerminalID] = newSessID
 			ts.FocusedSessionID = newSessID
 			if updatedLayout, err := client.ExportLayout(tabID); err == nil {
-				if updatedSplit := findDrawerSplit(&updatedLayout.Root, anchorPaneID, paneToTerm, ts.TermToSession, true); updatedSplit != nil {
+				if updatedSplit := findDrawerSplit(&updatedLayout.Root, anchorPaneID, paneToTerm, ts.TermToSession, profile.Placement, true); updatedSplit != nil {
 					paneByID[newPane.PaneID] = *newPane
 					paneToTerm[newPane.PaneID] = newPane.TerminalID
-					if updatedTree := layoutToDrawerTree(updatedSplit.Second, paneByID, ts.TermToSession); updatedTree != nil {
+					updatedSubtree, _ := splitBranch(updatedSplit, normalizePlacement(profile.Placement).utilityOnFirst)
+					if updatedTree := layoutToDrawerTree(updatedSubtree, paneByID, ts.TermToSession); updatedTree != nil {
 						ts.Tree = updatedTree
 					}
 				}
@@ -1310,6 +1469,7 @@ func main() {
 	var cwd string
 	var direction string
 	var sessionID string
+	var profileName string
 	var setupPath string
 	var rows int
 	var cols int
@@ -1319,6 +1479,7 @@ func main() {
 	fs.StringVar(&cwd, "cwd", "", "Working directory for new drawer")
 	fs.StringVar(&direction, "direction", "right", "Split direction (right or down)")
 	fs.StringVar(&sessionID, "session", "", "Drawer PTY session ID")
+	fs.StringVar(&profileName, "profile", "", "Profile name from profiles.toml")
 	fs.StringVar(&setupPath, "path", "", "Target path for Neovim plugin config (used with setup)")
 	fs.IntVar(&rows, "rows", 24, "Initial PTY rows")
 	fs.IntVar(&cols, "cols", 80, "Initial PTY cols")
@@ -1350,7 +1511,7 @@ func main() {
 		return
 	}
 
-	if err := runAction(action, paneID, cwd, direction); err != nil {
+	if err := runAction(action, paneID, cwd, direction, profileName); err != nil {
 		fmt.Fprintf(os.Stderr, "herdr-drawer: %v\n", err)
 		os.Exit(1)
 	}

@@ -2,7 +2,7 @@ id = "herdr-drawer"
 name = "Herdr Terminal Drawer"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "VS Code-style persistent, multi-pane bottom terminal drawer scoped to each herdr tab"
+description = "Persistent, profile-driven utility panes (drawer/sidecar) scoped to each herdr tab"
 platforms = ["linux", "macos"]
 
 [[build]]
