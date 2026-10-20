@@ -9,7 +9,7 @@ import (
 func TestResolveProfileDefaults(t *testing.T) {
 	cfg := &ProfilesFile{}
 	p := resolveProfile("default", cfg)
-	if p.Placement != "down" || p.SizeRatio != 0.30 || !p.PersistOnHide {
+	if p.Placement != "down" || p.Scope != "anchor" || p.SizeRatio != 0.30 || !p.PersistOnHide {
 		t.Fatalf("unexpected defaults: %+v", p)
 	}
 }
@@ -22,6 +22,7 @@ default_profile = "agentRight"
 
 [profiles.agentRight]
 placement = "right"
+scope = "tab"
 size_ratio = 0.35
 persist_on_hide = false
 command = "cursor agent --cwd {{cwd}}"
@@ -37,7 +38,7 @@ command = "cursor agent --cwd {{cwd}}"
 		t.Fatalf("default profile mismatch: %q", got)
 	}
 	p := resolveProfile("agentRight", cfg)
-	if p.Placement != "right" || p.SizeRatio != 0.35 || p.PersistOnHide {
+	if p.Placement != "right" || p.Scope != "tab" || p.SizeRatio != 0.35 || p.PersistOnHide {
 		t.Fatalf("unexpected profile: %+v", p)
 	}
 	if got := renderProfileCommand(p.Command, "/tmp/proj"); got != "cursor agent --cwd /tmp/proj" {

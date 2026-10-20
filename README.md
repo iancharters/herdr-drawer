@@ -88,23 +88,28 @@ default_profile = "default"
 
 [profiles.default]
 placement = "down"        # down|up|left|right
+scope = "anchor"          # anchor|tab
 size_ratio = 0.30         # percent of screen used by utility pane
 persist_on_hide = true    # true = hide/unhide; false = restart on next open
 
 [profiles.cursorRight]
 placement = "right"
+scope = "tab"
 size_ratio = 0.35
 persist_on_hide = true
 command = "cursor agent --cwd {{cwd}}"
 
 [profiles.opencodeLeft]
 placement = "left"
+scope = "anchor"
 size_ratio = 0.35
 persist_on_hide = false
 command = "opencode --project {{cwd}}"
 ```
 
 `command` runs only when a new session is created for that profile. `{{cwd}}` (or `${cwd}`) is replaced with the anchor pane cwd.
+
+`scope = "anchor"` keeps behavior local to the pane you trigger from (for example, drawer under Neovim only). `scope = "tab"` applies the utility split against the full tab root so the pane spans the tab dimension for that side.
 
 Bind arbitrary keys to specific profiles:
 

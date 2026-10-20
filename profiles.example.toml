@@ -2,17 +2,20 @@ default_profile = "default"
 
 [profiles.default]
 placement = "down"
+scope = "anchor"
 size_ratio = 0.30
 persist_on_hide = true
 
 [profiles.cursorRight]
 placement = "right"
+scope = "tab"
 size_ratio = 0.35
 persist_on_hide = true
 command = "cursor agent --cwd {{cwd}}"
 
 [profiles.opencodeLeft]
 placement = "left"
+scope = "anchor"
 size_ratio = 0.35
 persist_on_hide = false
 command = "opencode --project {{cwd}}"

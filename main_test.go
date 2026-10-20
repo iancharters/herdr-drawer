@@ -62,7 +62,7 @@ func TestFindDrawerSplitAndSnapshot(t *testing.T) {
 		"term_d2": "s-222",
 	}
 
-	split := findDrawerSplit(root, "w4:p1", paneToTerm, termToSession, "down", false)
+	split := findDrawerSplit(root, "w4:p1", paneToTerm, termToSession, "down", "anchor", false)
 	if split == nil {
 		t.Fatalf("expected to find drawer split")
 	}
@@ -116,7 +116,7 @@ func TestFindDrawerSplitLeftPlacement(t *testing.T) {
 	termToSession := map[string]string{
 		"term_u": "s-utility",
 	}
-	split := findDrawerSplit(root, "w1:pA", paneToTerm, termToSession, "left", false)
+	split := findDrawerSplit(root, "w1:pA", paneToTerm, termToSession, "left", "anchor", false)
 	if split == nil {
 		t.Fatalf("expected left-placement split to be found")
 	}
@@ -132,6 +132,34 @@ func TestSplitRatioForPlacement(t *testing.T) {
 	}
 	if got := splitRatioForPlacement(0.30, "left"); got != 0.30 {
 		t.Fatalf("left ratio mismatch: got %v", got)
+	}
+}
+
+func TestFindDrawerSplitTabScope(t *testing.T) {
+	root := &LayoutNode{
+		Type:      "split",
+		Direction: "down",
+		Ratio:     0.7,
+		First: &LayoutNode{
+			Type:      "split",
+			Direction: "right",
+			Ratio:     0.5,
+			First:     &LayoutNode{Type: "pane", PaneID: "w1:p1"},
+			Second:    &LayoutNode{Type: "pane", PaneID: "w1:p2"},
+		},
+		Second: &LayoutNode{Type: "pane", PaneID: "w1:pU"},
+	}
+	paneToTerm := map[string]string{
+		"w1:p1": "term1",
+		"w1:p2": "term2",
+		"w1:pU": "termU",
+	}
+	termToSession := map[string]string{
+		"termU": "s-u",
+	}
+	split := findDrawerSplit(root, "w1:p1", paneToTerm, termToSession, "down", "tab", false)
+	if split == nil || split != root {
+		t.Fatalf("expected tab-scope split to resolve to root")
 	}
 }
 

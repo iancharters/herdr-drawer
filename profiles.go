@@ -17,6 +17,7 @@ type ProfilesFile struct {
 
 type ProfileConfig struct {
 	Placement     string  `toml:"placement"`
+	Scope         string  `toml:"scope"`
 	SizeRatio     float64 `toml:"size_ratio"`
 	PersistOnHide *bool   `toml:"persist_on_hide"`
 	Command       string  `toml:"command"`
@@ -25,6 +26,7 @@ type ProfileConfig struct {
 type EffectiveProfile struct {
 	Name          string
 	Placement     string
+	Scope         string
 	SizeRatio     float64
 	PersistOnHide bool
 	Command       string
@@ -81,6 +83,7 @@ func resolveProfile(profileName string, cfg *ProfilesFile) EffectiveProfile {
 	out := EffectiveProfile{
 		Name:          profileName,
 		Placement:     "down",
+		Scope:         "anchor",
 		SizeRatio:     0.30,
 		PersistOnHide: true,
 	}
@@ -93,6 +96,9 @@ func resolveProfile(profileName string, cfg *ProfilesFile) EffectiveProfile {
 	}
 	if dir := strings.ToLower(strings.TrimSpace(p.Placement)); dir == "up" || dir == "down" || dir == "left" || dir == "right" {
 		out.Placement = dir
+	}
+	if scope := strings.ToLower(strings.TrimSpace(p.Scope)); scope == "tab" || scope == "anchor" {
+		out.Scope = scope
 	}
 	if p.SizeRatio >= 0.1 && p.SizeRatio <= 0.9 {
 		out.SizeRatio = p.SizeRatio
