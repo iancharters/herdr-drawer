@@ -5,17 +5,23 @@ placement = "down"
 scope = "anchor"
 size_ratio = 0.30
 persist_on_hide = true
+show_command_text = false
+anchor_policy = "app_in_tab_or_tab_scope"
+anchor_app_match = ["nvim", "vim"]
 
 [profiles.cursorRight]
 placement = "right"
 scope = "tab"
 size_ratio = 0.35
 persist_on_hide = true
-command = "cursor agent --cwd {{cwd}}"
+show_command_text = false
+command = "cursor agent"
 
 [profiles.opencodeLeft]
 placement = "left"
 scope = "anchor"
 size_ratio = 0.35
 persist_on_hide = false
+show_command_text = false
+anchor_policy = "generic_non_plugin"
 command = "opencode --project {{cwd}}"

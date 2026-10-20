@@ -81,6 +81,7 @@ type sessionHandshake struct {
 	Rows      uint16 `json:"rows,omitempty"`
 	Cols      uint16 `json:"cols,omitempty"`
 	Command   string `json:"command,omitempty"`
+	ShowCmd   bool   `json:"show_command_text,omitempty"`
 }
 
 func daemonSocketPath() string {
@@ -229,10 +230,10 @@ func listDaemonSessions() []string {
 }
 
 func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
-	return ensureSessionHostWithCommand(sessionID, cwd, rows, cols, "")
+	return ensureSessionHostWithCommand(sessionID, cwd, rows, cols, "", false)
 }
 
-func ensureSessionHostWithCommand(sessionID, cwd string, rows, cols uint16, command string) error {
+func ensureSessionHostWithCommand(sessionID, cwd string, rows, cols uint16, command string, showCommand bool) error {
 	if sessionID == "" {
 		return errors.New("missing session ID")
 	}
@@ -251,6 +252,7 @@ func ensureSessionHostWithCommand(sessionID, cwd string, rows, cols uint16, comm
 		Rows:      rows,
 		Cols:      cols,
 		Command:   command,
+		ShowCmd:   showCommand,
 	}, &resp); err != nil {
 		return err
 	}
@@ -436,7 +438,7 @@ func sanitizeShellEnv(requestedTerm string) []string {
 	return env
 }
 
-func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16, initCommand string) (*ptySession, error) {
+func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16, initCommand string, showCommand bool) (*ptySession, error) {
 	if sessionID == "" {
 		return nil, errors.New("missing session ID")
 	}
@@ -475,7 +477,12 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 		cwd, _ = os.UserHomeDir()
 	}
 
-	cmd := exec.Command(shell, "-l")
+	var cmd *exec.Cmd
+	if strings.TrimSpace(initCommand) != "" && !showCommand {
+		cmd = exec.Command(shell, "-lc", initCommand)
+	} else {
+		cmd = exec.Command(shell, "-l")
+	}
 	cmd.Dir = cwd
 	cmd.Stdin = slave
 	cmd.Stdout = slave
@@ -576,7 +583,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "ensure":
-		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, hs.Command)
+		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, hs.Command, hs.ShowCmd)
 		if err != nil {
 			resp, _ := json.Marshal(map[string]any{"alive": false, "error": err.Error()})
 			_, _ = c.Write(append(resp, '\n'))
@@ -633,7 +640,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "attach":
-		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, "")
+		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, "", false)
 		if err != nil {
 			_ = c.Close()
 			return
@@ -903,7 +910,10 @@ func shouldKeepSessionAliveWithSnapshot(sessionID string, attached bool, panes [
 					return true
 				}
 			}
-			return false
+			// A visible profile can transiently lose pane mappings during hide/close
+			// state transitions before the state file is persisted. Keep the session
+			// alive; gcOrphanedDrawers will clean up true orphans on the next action.
+			return true
 		}
 		return true
 	}

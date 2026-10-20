@@ -16,11 +16,14 @@ type ProfilesFile struct {
 }
 
 type ProfileConfig struct {
-	Placement     string  `toml:"placement"`
-	Scope         string  `toml:"scope"`
-	SizeRatio     float64 `toml:"size_ratio"`
-	PersistOnHide *bool   `toml:"persist_on_hide"`
-	Command       string  `toml:"command"`
+	Placement     string   `toml:"placement"`
+	Scope         string   `toml:"scope"`
+	SizeRatio     float64  `toml:"size_ratio"`
+	PersistOnHide *bool    `toml:"persist_on_hide"`
+	Command       string   `toml:"command"`
+	ShowCommand   *bool    `toml:"show_command_text"`
+	AnchorPolicy  string   `toml:"anchor_policy"`
+	AnchorAppRaw  []string `toml:"anchor_app_match"`
 }
 
 type EffectiveProfile struct {
@@ -30,6 +33,9 @@ type EffectiveProfile struct {
 	SizeRatio     float64
 	PersistOnHide bool
 	Command       string
+	ShowCommand   bool
+	AnchorPolicy  string
+	AnchorApp     []string
 }
 
 func defaultPersist() bool {
@@ -86,6 +92,8 @@ func resolveProfile(profileName string, cfg *ProfilesFile) EffectiveProfile {
 		Scope:         "anchor",
 		SizeRatio:     0.30,
 		PersistOnHide: true,
+		ShowCommand:   false,
+		AnchorPolicy:  "generic_non_plugin",
 	}
 	if cfg == nil || cfg.Profiles == nil {
 		return out
@@ -105,6 +113,20 @@ func resolveProfile(profileName string, cfg *ProfilesFile) EffectiveProfile {
 	}
 	if p.PersistOnHide != nil {
 		out.PersistOnHide = *p.PersistOnHide
+	}
+	if p.ShowCommand != nil {
+		out.ShowCommand = *p.ShowCommand
+	}
+	if ap := strings.ToLower(strings.TrimSpace(p.AnchorPolicy)); ap == "generic_non_plugin" || ap == "app_in_tab_or_tab_scope" {
+		out.AnchorPolicy = ap
+	}
+	for _, part := range p.AnchorAppRaw {
+		if s := strings.ToLower(strings.TrimSpace(part)); s != "" {
+			out.AnchorApp = append(out.AnchorApp, s)
+		}
+	}
+	if out.AnchorPolicy == "app_in_tab_or_tab_scope" && len(out.AnchorApp) == 0 {
+		out.AnchorApp = []string{"nvim", "vim"}
 	}
 	out.Command = strings.TrimSpace(p.Command)
 	return out

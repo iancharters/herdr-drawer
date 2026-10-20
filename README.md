@@ -91,13 +91,17 @@ placement = "down"        # down|up|left|right
 scope = "anchor"          # anchor|tab
 size_ratio = 0.30         # percent of screen used by utility pane
 persist_on_hide = true    # true = hide/unhide; false = restart on next open
+show_command_text = false # false = hide typed startup command text
+anchor_policy = "app_in_tab_or_tab_scope" # generic_non_plugin|app_in_tab_or_tab_scope
+anchor_app_match = ["nvim", "vim"]        # used when anchor_policy is app-scoped
 
 [profiles.cursorRight]
 placement = "right"
 scope = "tab"
 size_ratio = 0.35
 persist_on_hide = true
-command = "cursor agent --cwd {{cwd}}"
+show_command_text = false
+command = "cursor agent"
 
 [profiles.opencodeLeft]
 placement = "left"
@@ -109,7 +113,14 @@ command = "opencode --project {{cwd}}"
 
 `command` runs only when a new session is created for that profile. `{{cwd}}` (or `${cwd}`) is replaced with the anchor pane cwd.
 
-`scope = "anchor"` keeps behavior local to the pane you trigger from (for example, drawer under Neovim only). `scope = "tab"` applies the utility split against the full tab root so the pane spans the tab dimension for that side.
+`scope = "anchor"` keeps behavior local to an anchor pane, while `scope = "tab"` applies the utility split against the full tab root so the pane spans that side.
+
+When `show_command_text = false` (default), startup commands run without printing the typed command in the pane; you only see program output. Set it to `true` if you want debug-visible command entry.
+
+Anchoring rules:
+- `anchor_policy = "generic_non_plugin"` anchors to a non-plugin pane in the tab.
+- `anchor_policy = "app_in_tab_or_tab_scope"` first tries panes running `anchor_app_match` apps, then falls back to tab-scoped behavior if no match exists.
+- Drawer/plugin panes are never chosen as anchors.
 
 ### 2.2 Cleanup commands
 

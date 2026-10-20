@@ -9,7 +9,7 @@ import (
 func TestResolveProfileDefaults(t *testing.T) {
 	cfg := &ProfilesFile{}
 	p := resolveProfile("default", cfg)
-	if p.Placement != "down" || p.Scope != "anchor" || p.SizeRatio != 0.30 || !p.PersistOnHide {
+	if p.Placement != "down" || p.Scope != "anchor" || p.SizeRatio != 0.30 || !p.PersistOnHide || p.ShowCommand || p.AnchorPolicy != "generic_non_plugin" {
 		t.Fatalf("unexpected defaults: %+v", p)
 	}
 }
@@ -26,6 +26,9 @@ scope = "tab"
 size_ratio = 0.35
 persist_on_hide = false
 command = "cursor agent --cwd {{cwd}}"
+show_command_text = true
+anchor_policy = "app_in_tab_or_tab_scope"
+anchor_app_match = ["nvim", "vim"]
 `
 	if err := os.WriteFile(filepath.Join(tmp, "profiles.toml"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write profiles: %v", err)
@@ -38,8 +41,11 @@ command = "cursor agent --cwd {{cwd}}"
 		t.Fatalf("default profile mismatch: %q", got)
 	}
 	p := resolveProfile("agentRight", cfg)
-	if p.Placement != "right" || p.Scope != "tab" || p.SizeRatio != 0.35 || p.PersistOnHide {
+	if p.Placement != "right" || p.Scope != "tab" || p.SizeRatio != 0.35 || p.PersistOnHide || !p.ShowCommand || p.AnchorPolicy != "app_in_tab_or_tab_scope" {
 		t.Fatalf("unexpected profile: %+v", p)
+	}
+	if len(p.AnchorApp) != 2 || p.AnchorApp[0] != "nvim" || p.AnchorApp[1] != "vim" {
+		t.Fatalf("unexpected anchor apps: %+v", p.AnchorApp)
 	}
 	if got := renderProfileCommand(p.Command, "/tmp/proj"); got != "cursor agent --cwd /tmp/proj" {
 		t.Fatalf("rendered command mismatch: %q", got)
