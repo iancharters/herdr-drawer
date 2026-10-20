@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -15,14 +14,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
-	"unicode/utf8"
 	"unsafe"
 
 	"github.com/google/shlex"
@@ -33,8 +29,6 @@ const (
 	frameResize byte = 0x02
 	maxRingSize      = 128 * 1024
 )
-
-var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 type winsize struct {
 	Row    uint16
@@ -59,12 +53,20 @@ func setWinsize(fd uintptr, rows, cols uint16) {
 	_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
 }
 
-func hasSubstantiveOutput(out []byte) bool {
-	if len(out) == 0 {
-		return false
+func parseResumeArgv(resumeCommand string) []string {
+	resumeCommand = strings.TrimSpace(resumeCommand)
+	if resumeCommand == "" {
+		return nil
 	}
-	cleaned := ansiEscapeRe.ReplaceAll(out, nil)
-	return strings.TrimSpace(string(cleaned)) != ""
+	args, err := shlex.Split(resumeCommand)
+	if err != nil || len(args) == 0 {
+		return nil
+	}
+	args[0] = filepath.Base(args[0])
+	if args[0] == "" || args[0] == "." || args[0] == "/" {
+		return nil
+	}
+	return args
 }
 
 type ringBuffer struct {
@@ -437,6 +439,10 @@ func sanitizeShellEnv(requestedTerm string) []string {
 			"GLOBAL_AGENT_ENVIRONMENT_VARIABLE_NAMESPACE",
 			"HERDR_DRAWER_SESSION_ID",
 			"HERDR_DRAWER_CWD",
+			"HERDR_DRAWER_AGENT_LABEL",
+			"HERDR_DRAWER_RESUME_COMMAND",
+			"HERDR_DRAWER_STARTUP_COMMAND",
+			"HERDR_DRAWER_SHOW_COMMAND",
 			"HERDR_PANE_ID",
 			"HERDR_PLUGIN_ACTION_ID",
 			"HERDR_PLUGIN_ENTRYPOINT_ID",
@@ -565,20 +571,16 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 			n, err := master.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				sess.ring.Write(chunk)
 				sess.clientMu.Lock()
+				sess.ring.Write(chunk)
 				c := sess.activeConn
-				sess.clientMu.Unlock()
 				if c != nil {
 					if _, werr := c.Write(chunk); werr != nil {
-						sess.clientMu.Lock()
-						if sess.activeConn == c {
-							sess.activeConn = nil
-						}
-						sess.clientMu.Unlock()
+						sess.activeConn = nil
 						_ = c.Close()
 					}
 				}
+				sess.clientMu.Unlock()
 			}
 			if err != nil {
 				return
@@ -674,24 +676,27 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		d.shutdown()
 
 	case "attach":
-		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, "", false)
+		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, hs.Command, hs.ShowCmd)
 		if err != nil {
 			_ = c.Close()
 			return
 		}
-		if hs.Rows > 0 && hs.Cols > 0 {
-			setWinsize(sess.master.Fd(), hs.Rows, hs.Cols)
-		}
 		sess.clientMu.Lock()
 		old := sess.activeConn
-		sess.activeConn = c
 		snap := sess.ring.Snapshot()
 		if len(snap) > 0 {
 			_, _ = c.Write(snap)
 		}
+		sess.activeConn = c
 		sess.clientMu.Unlock()
 		if old != nil && old != c {
 			_ = old.Close()
+		}
+		if hs.Rows > 0 && hs.Cols > 0 {
+			curR, curC := getWinsize(sess.master.Fd())
+			if curR != hs.Rows || curC != hs.Cols {
+				setWinsize(sess.master.Fd(), hs.Rows, hs.Cols)
+			}
 		}
 
 		var hdr [5]byte
@@ -721,7 +726,12 @@ func (d *daemonServer) handleConn(c net.Conn) {
 				}
 				r := binary.BigEndian.Uint16(hdr[1:3])
 				cols := binary.BigEndian.Uint16(hdr[3:5])
-				setWinsize(sess.master.Fd(), r, cols)
+				if r > 0 && cols > 0 {
+					curR, curC := getWinsize(sess.master.Fd())
+					if curR != r || curC != cols {
+						setWinsize(sess.master.Fd(), r, cols)
+					}
+				}
 			default:
 				goto done
 			}
@@ -961,6 +971,71 @@ func shouldKeepSessionAliveWithSnapshot(sessionID string, attached bool, panes [
 	return false
 }
 
+func watchDrawerAgentStatus(paneID, agentLabel, sessionID, resumeCommand string, outputNotifyCh <-chan struct{}, doneCh <-chan struct{}) {
+	sockPath, err := resolveSocketPath()
+	if err != nil || sockPath == "" {
+		return
+	}
+	client := &RPCClient{
+		socketPath: sockPath,
+		timeout:    400 * time.Millisecond,
+	}
+	seq := uint64(time.Now().UnixNano())
+	nextSeq := func() uint64 {
+		seq++
+		return seq
+	}
+
+	currentState := "idle"
+	_ = client.ReportPaneAgent(paneID, pluginID, agentLabel, currentState, "", sessionID, resumeCommand, nextSeq())
+	_ = client.ReportPaneAgentSession(paneID, pluginID, agentLabel, sessionID, resumeCommand, nextSeq())
+
+	evaluate := func() {
+		state, reason, skip, err := client.ExplainAgent(paneID)
+		if err != nil || skip {
+			return
+		}
+		if state != "idle" && state != "working" && state != "blocked" {
+			return
+		}
+		if state == currentState {
+			return
+		}
+		currentState = state
+		_ = client.ReportPaneAgent(paneID, pluginID, agentLabel, currentState, reason, sessionID, resumeCommand, nextSeq())
+	}
+
+	debounceTimer := time.NewTimer(150 * time.Millisecond)
+	if !debounceTimer.Stop() {
+		select {
+		case <-debounceTimer.C:
+		default:
+		}
+	}
+	defer debounceTimer.Stop()
+	debouncePending := false
+
+	pollTicker := time.NewTicker(500 * time.Millisecond)
+	defer pollTicker.Stop()
+
+	for {
+		select {
+		case <-doneCh:
+			return
+		case <-outputNotifyCh:
+			if !debouncePending {
+				debounceTimer.Reset(150 * time.Millisecond)
+				debouncePending = true
+			}
+		case <-debounceTimer.C:
+			debouncePending = false
+			evaluate()
+		case <-pollTicker.C:
+			evaluate()
+		}
+	}
+}
+
 func runAttach(sessionID, cwd string) error {
 	if sessionID == "" {
 		sessionID = os.Getenv("HERDR_DRAWER_SESSION_ID")
@@ -972,100 +1047,42 @@ func runAttach(sessionID, cwd string) error {
 		return errors.New("HERDR_DRAWER_SESSION_ID is not set")
 	}
 	paneID := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
+	resumeCommand := strings.TrimSpace(os.Getenv("HERDR_DRAWER_RESUME_COMMAND"))
+	startupCommand := strings.TrimSpace(os.Getenv("HERDR_DRAWER_STARTUP_COMMAND"))
+	showCommand := os.Getenv("HERDR_DRAWER_SHOW_COMMAND") == "true" || os.Getenv("HERDR_DRAWER_SHOW_COMMAND") == "1"
 	agentLabel := strings.TrimSpace(os.Getenv("HERDR_DRAWER_AGENT_LABEL"))
 	if agentLabel == "" {
-		agentLabel = inferAgentLabel(os.Getenv("HERDR_DRAWER_RESUME_COMMAND"))
+		agentLabel = inferAgentLabel(resumeCommand)
 	}
-	resumeCommand := strings.TrimSpace(os.Getenv("HERDR_DRAWER_RESUME_COMMAND"))
+	if agentLabel == "" {
+		agentLabel = inferAgentLabel(startupCommand)
+	}
 
-	rows, cols := getWinsize(os.Stdin.Fd())
+	winchCh := make(chan os.Signal, 4)
+	signal.Notify(winchCh, syscall.SIGWINCH)
+	defer signal.Stop(winchCh)
+
+	termCh := make(chan os.Signal, 2)
+	signal.Notify(termCh, syscall.SIGHUP, syscall.SIGTERM)
+	defer signal.Stop(termCh)
+
 	if err := ensureDaemon(); err != nil {
 		return err
 	}
 
-	reportLifecycle := func(state, msg string) {
-		if paneID == "" || agentLabel == "" {
-			return
+	select {
+	case <-winchCh:
+		time.Sleep(10 * time.Millisecond)
+		for len(winchCh) > 0 {
+			<-winchCh
 		}
-		args := []string{"pane", "report-agent", "--source", pluginID, "--agent", agentLabel, "--state", state, "--agent-session-id", sessionID}
-		if strings.TrimSpace(msg) != "" {
-			args = append(args, "--message", msg)
-		}
-		args = append(args, paneID)
-		if resumeCommand != "" {
-			if resumeArgs, err := shlex.Split(resumeCommand); err == nil && len(resumeArgs) > 0 {
-				args = append(args, "--")
-				args = append(args, resumeArgs...)
-			}
-		}
-		_ = exec.Command("herdr", args...).Run()
+	case <-time.After(30 * time.Millisecond):
 	}
-	reportSession := func() {
-		if paneID == "" || agentLabel == "" {
-			return
-		}
-		args := []string{"pane", "report-agent-session", "--source", pluginID, "--agent", agentLabel, "--agent-session-id", sessionID, "--session-start-source", "plugin", paneID}
-		if resumeCommand != "" {
-			if resumeArgs, err := shlex.Split(resumeCommand); err == nil && len(resumeArgs) > 0 {
-				args = append(args, "--")
-				args = append(args, resumeArgs...)
-			}
-		}
-		_ = exec.Command("herdr", args...).Run()
-	}
-	releaseLifecycle := func() {
-		if paneID == "" || agentLabel == "" {
-			return
-		}
-		_ = exec.Command("herdr", "pane", "release-agent", "--source", pluginID, "--agent", agentLabel, paneID).Run()
-	}
-	reportSession()
-	currentState := "idle"
-	reportLifecycle(currentState, "")
-	doneCh := make(chan struct{})
-	var stateMu sync.Mutex
-	var lastActivityUnix int64 = time.Now().UnixNano()
-	setState := func(next, msg string) {
-		if next == "" {
-			return
-		}
-		stateMu.Lock()
-		defer stateMu.Unlock()
-		if next == currentState {
-			return
-		}
-		currentState = next
-		reportLifecycle(next, msg)
-	}
-	touchActivity := func() {
-		atomic.StoreInt64(&lastActivityUnix, time.Now().UnixNano())
-	}
-	go func() {
-		t := time.NewTicker(1 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-doneCh:
-				return
-			case <-t.C:
-				stateMu.Lock()
-				st := currentState
-				stateMu.Unlock()
-				if st != "working" {
-					continue
-				}
-				last := time.Unix(0, atomic.LoadInt64(&lastActivityUnix))
-				if time.Since(last) >= 4*time.Second {
-					setState("idle", "")
-				}
-			}
-		}
-	}()
-	defer releaseLifecycle()
+
+	rows, cols := getWinsize(os.Stdin.Fd())
 
 	conn, err := net.DialTimeout("unix", daemonSocketPath(), 2*time.Second)
 	if err != nil {
-		reportLifecycle("unknown", err.Error())
 		return err
 	}
 	defer conn.Close()
@@ -1080,37 +1097,45 @@ func runAttach(sessionID, cwd string) error {
 		Term:      os.Getenv("TERM"),
 		Rows:      rows,
 		Cols:      cols,
+		Command:   startupCommand,
+		ShowCmd:   showCommand,
 	})
 	if _, err := conn.Write(append(hsBytes, '\n')); err != nil {
-		reportLifecycle("unknown", err.Error())
 		return err
 	}
 
+	doneCh := make(chan struct{})
 	var writeMu sync.Mutex
-	sendResize := func() {
+	lastRows, lastCols := rows, cols
+	syncWinsize := func() {
 		r, c := getWinsize(os.Stdin.Fd())
+		if r == 0 || c == 0 {
+			return
+		}
+		writeMu.Lock()
+		if r == lastRows && c == lastCols {
+			writeMu.Unlock()
+			return
+		}
+		lastRows, lastCols = r, c
 		var pkt [5]byte
 		pkt[0] = frameResize
 		binary.BigEndian.PutUint16(pkt[1:3], r)
 		binary.BigEndian.PutUint16(pkt[3:5], c)
-		writeMu.Lock()
 		_, _ = conn.Write(pkt[:])
 		writeMu.Unlock()
 	}
-
-	winchCh := make(chan os.Signal, 4)
-	signal.Notify(winchCh, syscall.SIGWINCH)
-	defer signal.Stop(winchCh)
-
-	termCh := make(chan os.Signal, 2)
-	signal.Notify(termCh, syscall.SIGHUP, syscall.SIGTERM)
-	defer signal.Stop(termCh)
+	syncWinsize()
 
 	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-winchCh:
-				sendResize()
+				syncWinsize()
+			case <-ticker.C:
+				syncWinsize()
 			case <-termCh:
 				_ = conn.Close()
 				return
@@ -1119,6 +1144,11 @@ func runAttach(sessionID, cwd string) error {
 			}
 		}
 	}()
+
+	outputNotifyCh := make(chan struct{}, 1)
+	if paneID != "" && agentLabel != "" {
+		go watchDrawerAgentStatus(paneID, agentLabel, sessionID, resumeCommand, outputNotifyCh, doneCh)
+	}
 
 	go func() {
 		buf := make([]byte, 4096)
@@ -1136,10 +1166,6 @@ func runAttach(sessionID, cwd string) error {
 					_ = conn.Close()
 					return
 				}
-				if bytes.Contains(buf[:n], []byte{'\n'}) {
-					touchActivity()
-					setState("working", "")
-				}
 			}
 			if err != nil {
 				_ = conn.Close()
@@ -1148,48 +1174,20 @@ func runAttach(sessionID, cwd string) error {
 		}
 	}()
 
-	looksBlocked := func(s string) bool {
-		ls := strings.ToLower(s)
-		return strings.Contains(ls, "needs your input") ||
-			strings.Contains(ls, "need your input") ||
-			strings.Contains(ls, "requires your input") ||
-			strings.Contains(ls, "requires approval") ||
-			strings.Contains(ls, "waiting for your response") ||
-			strings.Contains(ls, "press enter to continue")
-	}
-	looksIdle := func(s string) bool {
-		return strings.Contains(s, "❯ ") || strings.Contains(s, "-> cursor agent")
-	}
-
 	chunk := make([]byte, 4096)
 	for {
 		n, err := conn.Read(chunk)
 		if n > 0 {
-			out := chunk[:n]
-			_, _ = os.Stdout.Write(out)
-			substantive := hasSubstantiveOutput(out)
-			if substantive {
-				touchActivity()
-			}
-			if utf8.Valid(out) {
-				text := string(out)
-				switch {
-				case looksBlocked(text):
-					setState("blocked", "")
-				case looksIdle(text):
-					setState("idle", "")
-				default:
-					if substantive {
-						setState("working", "")
-					}
-				}
+			_, _ = os.Stdout.Write(chunk[:n])
+			select {
+			case outputNotifyCh <- struct{}{}:
+			default:
 			}
 		}
 		if err != nil {
 			break
 		}
 	}
-	reportLifecycle("unknown", "")
 	close(doneCh)
 	return nil
 }

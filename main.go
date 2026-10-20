@@ -25,6 +25,7 @@ const (
 
 type RPCClient struct {
 	socketPath string
+	timeout    time.Duration
 	reqCounter uint64
 }
 
@@ -210,12 +211,18 @@ func resolveSocketPath() (string, error) {
 }
 
 func (c *RPCClient) Call(method string, params interface{}, out interface{}) error {
-	conn, err := net.DialTimeout("unix", c.socketPath, 2*time.Second)
+	dialTimeout := 2 * time.Second
+	callTimeout := 5 * time.Second
+	if c.timeout > 0 {
+		dialTimeout = c.timeout
+		callTimeout = c.timeout
+	}
+	conn, err := net.DialTimeout("unix", c.socketPath, dialTimeout)
 	if err != nil {
 		return fmt.Errorf("connect %s: %w", c.socketPath, err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(callTimeout))
 
 	id := fmt.Sprintf("drawer-%d", atomic.AddUint64(&c.reqCounter, 1))
 	if params == nil {
@@ -295,10 +302,14 @@ func (c *RPCClient) GetProcessInfo(paneID string) (*ProcessInfo, error) {
 }
 
 func (c *RPCClient) OpenPluginSplitPane(targetPaneID, direction, cwd, sessionID string, focus bool) (*PaneInfo, error) {
-	return c.OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd, sessionID, "", "", focus)
+	return c.OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd, sessionID, "", "", "", false, focus)
 }
 
-func (c *RPCClient) OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd, sessionID, agentLabel, resumeCommand string, focus bool) (*PaneInfo, error) {
+func (c *RPCClient) OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd, sessionID, agentLabel, resumeCommand, startupCommand string, showCommand, focus bool) (*PaneInfo, error) {
+	showCmdStr := "false"
+	if showCommand {
+		showCmdStr = "true"
+	}
 	params := map[string]interface{}{
 		"plugin_id":      pluginID,
 		"entrypoint":     drawerEntrypointID,
@@ -307,10 +318,12 @@ func (c *RPCClient) OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd
 		"target_pane_id": targetPaneID,
 		"focus":          focus,
 		"env": map[string]string{
-			"HERDR_DRAWER_SESSION_ID":     sessionID,
-			"HERDR_DRAWER_CWD":            cwd,
-			"HERDR_DRAWER_AGENT_LABEL":    agentLabel,
-			"HERDR_DRAWER_RESUME_COMMAND": resumeCommand,
+			"HERDR_DRAWER_SESSION_ID":      sessionID,
+			"HERDR_DRAWER_CWD":             cwd,
+			"HERDR_DRAWER_AGENT_LABEL":     agentLabel,
+			"HERDR_DRAWER_RESUME_COMMAND":  resumeCommand,
+			"HERDR_DRAWER_STARTUP_COMMAND": startupCommand,
+			"HERDR_DRAWER_SHOW_COMMAND":    showCmdStr,
 		},
 	}
 	if cwd != "" {
@@ -325,6 +338,67 @@ func (c *RPCClient) OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd
 		return nil, err
 	}
 	return &res.PluginPane.Pane, nil
+}
+
+func (c *RPCClient) ReportPaneAgent(paneID, source, agent, state, message, sessionID, resumeCommand string, seq uint64) error {
+	params := map[string]interface{}{
+		"pane_id": paneID,
+		"source":  source,
+		"agent":   agent,
+		"state":   state,
+		"seq":     seq,
+	}
+	if sessionID != "" {
+		params["agent_session_id"] = sessionID
+	}
+	if strings.TrimSpace(message) != "" {
+		params["message"] = message
+	}
+	if resumeArgv := parseResumeArgv(resumeCommand); len(resumeArgv) > 0 {
+		params["resume_argv"] = resumeArgv
+	}
+	return c.Call("pane.report_agent", params, nil)
+}
+
+func (c *RPCClient) ReportPaneAgentSession(paneID, source, agent, sessionID, resumeCommand string, seq uint64) error {
+	params := map[string]interface{}{
+		"pane_id":              paneID,
+		"source":               source,
+		"agent":                agent,
+		"session_start_source": "plugin",
+		"seq":                  seq,
+	}
+	if sessionID != "" {
+		params["agent_session_id"] = sessionID
+	}
+	if resumeArgv := parseResumeArgv(resumeCommand); len(resumeArgv) > 0 {
+		params["resume_argv"] = resumeArgv
+	}
+	return c.Call("pane.report_agent_session", params, nil)
+}
+
+func (c *RPCClient) ReleasePaneAgent(paneID, source, agent string, seq uint64) error {
+	params := map[string]interface{}{
+		"pane_id": paneID,
+		"source":  source,
+		"agent":   agent,
+		"seq":     seq,
+	}
+	return c.Call("pane.release_agent", params, nil)
+}
+
+func (c *RPCClient) ExplainAgent(paneID string) (string, string, bool, error) {
+	var res struct {
+		Explain struct {
+			State           string `json:"state"`
+			Reason          string `json:"reason"`
+			SkipStateUpdate bool   `json:"skip_state_update"`
+		} `json:"explain"`
+	}
+	if err := c.Call("agent.explain", map[string]interface{}{"target": paneID}, &res); err != nil {
+		return "", "", false, err
+	}
+	return res.Explain.State, res.Explain.Reason, res.Explain.SkipStateUpdate, nil
 }
 
 func (c *RPCClient) SetSplitRatio(tabID string, path []bool, ratio float64) error {
@@ -1133,9 +1207,9 @@ func reconstructLayoutSubtree(client *RPCClient, tabID string, node *LayoutNode,
 }
 
 func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, placement string, ratio float64, sessionID, cwd, startupCommand, resumeCommand, agentLabel string, showCommand bool, focus bool) (*PaneInfo, error) {
-	_ = ensureSessionHostWithCommand(sessionID, cwd, 24, 80, startupCommand, showCommand)
+	_ = ensureDaemon()
 	spec := normalizePlacement(placement)
-	pane, err := client.OpenPluginSplitPaneWithMetadata(targetPaneID, spec.layoutDirection, cwd, sessionID, agentLabel, resumeCommand, focus)
+	pane, err := client.OpenPluginSplitPaneWithMetadata(targetPaneID, spec.layoutDirection, cwd, sessionID, agentLabel, resumeCommand, startupCommand, showCommand, focus)
 	if err != nil {
 		return nil, err
 	}
@@ -1149,12 +1223,27 @@ func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, placement s
 			}
 		}
 	}
+	waitForAttachOrEnsureSession(sessionID, cwd, startupCommand, showCommand)
 	if focus {
 		if updated, err := client.GetPane(pane.PaneID); err == nil && updated != nil {
 			return updated, nil
 		}
 	}
 	return pane, nil
+}
+
+func waitForAttachOrEnsureSession(sessionID, cwd, startupCommand string, showCommand bool) {
+	if isSessionAlive(sessionID) {
+		return
+	}
+	deadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		if isSessionAlive(sessionID) {
+			return
+		}
+	}
+	_ = ensureSessionHostWithCommand(sessionID, cwd, 24, 80, startupCommand, showCommand)
 }
 
 func reconstructSplitsPreOrder(client *RPCClient, tabID string, node *DrawerNode, sessionToPane map[string]PaneInfo, termToSession map[string]string) error {
