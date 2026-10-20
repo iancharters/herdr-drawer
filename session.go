@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/google/shlex"
 )
 
 const (
@@ -479,7 +481,11 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 
 	var cmd *exec.Cmd
 	if strings.TrimSpace(initCommand) != "" && !showCommand {
-		cmd = exec.Command(shell, "-lc", initCommand)
+		if argv, err := shlex.Split(initCommand); err == nil && len(argv) > 0 {
+			cmd = exec.Command(argv[0], argv[1:]...)
+		} else {
+			cmd = exec.Command(shell, "-lc", initCommand)
+		}
 	} else {
 		cmd = exec.Command(shell, "-l")
 	}
