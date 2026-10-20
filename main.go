@@ -346,12 +346,36 @@ func (c *RPCClient) ApplyLayout(tabID string, root LayoutNode, focus bool) (*Lay
 	return &res.Layout, nil
 }
 
+func (c *RPCClient) MovePaneToTabSplit(paneID, tabID, direction, targetPaneID string, focus bool) error {
+	dest := map[string]interface{}{
+		"type":   "tab",
+		"tab_id": tabID,
+		"split":  direction,
+	}
+	if targetPaneID != "" {
+		dest["target_pane_id"] = targetPaneID
+	}
+	params := map[string]interface{}{
+		"pane_id":     paneID,
+		"destination": dest,
+		"focus":       focus,
+	}
+	return c.Call("pane.move", params, nil)
+}
+
 func (c *RPCClient) ClosePane(paneID string) error {
 	return c.Call("pane.close", map[string]interface{}{"pane_id": paneID}, nil)
 }
 
 func (c *RPCClient) FocusPane(paneID string) error {
 	return c.Call("pane.focus", map[string]interface{}{"pane_id": paneID}, nil)
+}
+
+func (c *RPCClient) SendText(paneID, text string) error {
+	return c.Call("pane.send_text", map[string]interface{}{
+		"pane_id": paneID,
+		"text":    text,
+	}, nil)
 }
 
 func (c *RPCClient) SwapPanes(sourcePaneID, targetPaneID string) error {
@@ -517,16 +541,21 @@ func cloneLayoutNode(node *LayoutNode) *LayoutNode {
 	if node == nil {
 		return nil
 	}
-	out := &LayoutNode{
-		Type:      node.Type,
-		PaneID:    node.PaneID,
-		Cwd:       node.Cwd,
+	if node.Type == "pane" {
+		// Keep pane references minimal when re-applying layouts. Carrying `cwd`
+		// from exported layouts can be interpreted as "spawn new terminal pane".
+		return &LayoutNode{
+			Type:   "pane",
+			PaneID: node.PaneID,
+		}
+	}
+	return &LayoutNode{
+		Type:      "split",
 		Direction: node.Direction,
 		Ratio:     node.Ratio,
+		First:     cloneLayoutNode(node.First),
+		Second:    cloneLayoutNode(node.Second),
 	}
-	out.First = cloneLayoutNode(node.First)
-	out.Second = cloneLayoutNode(node.Second)
-	return out
 }
 
 func layoutContainsAnyTerm(node *LayoutNode, paneToTerm map[string]string, termToSession map[string]string) bool {
@@ -891,30 +920,29 @@ func adoptNativeDrawerSplits(tabID string) error {
 	})
 }
 
-func applyTabScopedRootSplit(client *RPCClient, tabID, placement string, utilityRatio float64, baseRoot *LayoutNode, utilityPaneID string) error {
-	if baseRoot == nil || utilityPaneID == "" {
+func applyTabScopedRootSplit(client *RPCClient, tabID, placement string, utilityRatio float64, utilityPaneID string) error {
+	if utilityPaneID == "" {
 		return nil
 	}
 	spec := normalizePlacement(placement)
-	ratio := splitRatioForPlacement(utilityRatio, placement)
-	utilityLeaf := &LayoutNode{Type: "pane", PaneID: utilityPaneID}
-	var root LayoutNode
-	root.Type = "split"
-	root.Direction = spec.layoutDirection
-	root.Ratio = ratio
-	if spec.utilityOnFirst {
-		root.First = utilityLeaf
-		root.Second = cloneLayoutNode(baseRoot)
-	} else {
-		root.First = cloneLayoutNode(baseRoot)
-		root.Second = utilityLeaf
+	if err := client.MovePaneToTabSplit(utilityPaneID, tabID, spec.layoutDirection, "", true); err != nil {
+		return err
 	}
-	_, err := client.ApplyLayout(tabID, root, true)
-	return err
+	if spec.utilityOnFirst {
+		opposite := "left"
+		if spec.layoutDirection == "down" {
+			opposite = "up"
+		}
+		_ = client.Call("pane.swap", map[string]interface{}{
+			"source_pane_id": utilityPaneID,
+			"direction":      opposite,
+		}, nil)
+	}
+	return client.SetSplitRatio(tabID, []bool{}, splitRatioForPlacement(utilityRatio, placement))
 }
 
 func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, placement string, ratio float64, sessionID, cwd, command string, focus bool) (*PaneInfo, error) {
-	_ = ensureSessionHostWithCommand(sessionID, cwd, 24, 80, command)
+	_ = ensureSessionHost(sessionID, cwd, 24, 80)
 	spec := normalizePlacement(placement)
 	pane, err := client.OpenPluginSplitPane(targetPaneID, spec.layoutDirection, cwd, sessionID, focus)
 	if err != nil {
@@ -1138,7 +1166,6 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 	ts.WorkspaceID = anchorPane.WorkspaceID
 	ts.UtilityRatio = profile.SizeRatio
 	ts.TermToSession = map[string]string{}
-	baseLayout, _ := client.ExportLayout(ts.TabID)
 
 	prunedTree := ts.Tree
 	if profile.PersistOnHide {
@@ -1154,12 +1181,17 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 		if err != nil {
 			return err
 		}
-		if profile.Scope == "tab" && baseLayout != nil {
-			if err := applyTabScopedRootSplit(client, ts.TabID, profile.Placement, profile.SizeRatio, &baseLayout.Root, newPane.PaneID); err != nil {
+		if profile.Scope == "tab" {
+			if err := applyTabScopedRootSplit(client, ts.TabID, profile.Placement, profile.SizeRatio, newPane.PaneID); err != nil {
 				return err
 			}
 			if updated, err := client.GetPane(newPane.PaneID); err == nil && updated != nil {
 				newPane = updated
+			}
+		}
+		if command != "" {
+			if err := sendTextWithRetry(client, newPane.PaneID, command+"\n"); err != nil {
+				return fmt.Errorf("send profile command: %w", err)
 			}
 		}
 		ts.Tree = &DrawerNode{
@@ -1185,8 +1217,8 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 	if err != nil {
 		return err
 	}
-	if profile.Scope == "tab" && baseLayout != nil {
-		if err := applyTabScopedRootSplit(client, ts.TabID, profile.Placement, profile.SizeRatio, &baseLayout.Root, rootPane.PaneID); err != nil {
+	if profile.Scope == "tab" {
+		if err := applyTabScopedRootSplit(client, ts.TabID, profile.Placement, profile.SizeRatio, rootPane.PaneID); err != nil {
 			return err
 		}
 		if updated, err := client.GetPane(rootPane.PaneID); err == nil && updated != nil {
@@ -1218,6 +1250,19 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 	}
 
 	return nil
+}
+
+func sendTextWithRetry(client *RPCClient, paneID, text string) error {
+	var lastErr error
+	for i := 0; i < 20; i++ {
+		if err := client.SendText(paneID, text); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return lastErr
 }
 
 func cleanupSessions(client *RPCClient, sf *StateFile, termToPane map[string]PaneInfo, workspaceID string, all bool) {
