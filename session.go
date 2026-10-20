@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/google/shlex"
 )
 
 const (
@@ -80,6 +82,8 @@ type sessionHandshake struct {
 	Term      string `json:"term,omitempty"`
 	Rows      uint16 `json:"rows,omitempty"`
 	Cols      uint16 `json:"cols,omitempty"`
+	Command   string `json:"command,omitempty"`
+	ShowCmd   bool   `json:"show_command_text,omitempty"`
 }
 
 func daemonSocketPath() string {
@@ -227,7 +231,15 @@ func listDaemonSessions() []string {
 	return resp.Sessions
 }
 
+func shutdownDaemon() {
+	_ = callDaemon(sessionHandshake{Type: "shutdown"}, nil)
+}
+
 func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
+	return ensureSessionHostWithCommand(sessionID, cwd, rows, cols, "", false)
+}
+
+func ensureSessionHostWithCommand(sessionID, cwd string, rows, cols uint16, command string, showCommand bool) error {
 	if sessionID == "" {
 		return errors.New("missing session ID")
 	}
@@ -245,6 +257,8 @@ func ensureSessionHost(sessionID, cwd string, rows, cols uint16) error {
 		Term:      os.Getenv("TERM"),
 		Rows:      rows,
 		Cols:      cols,
+		Command:   command,
+		ShowCmd:   showCommand,
 	}, &resp); err != nil {
 		return err
 	}
@@ -430,7 +444,7 @@ func sanitizeShellEnv(requestedTerm string) []string {
 	return env
 }
 
-func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16) (*ptySession, error) {
+func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, initRows, initCols uint16, initCommand string, showCommand bool) (*ptySession, error) {
 	if sessionID == "" {
 		return nil, errors.New("missing session ID")
 	}
@@ -469,7 +483,21 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 		cwd, _ = os.UserHomeDir()
 	}
 
-	cmd := exec.Command(shell, "-l")
+	var cmd *exec.Cmd
+	trimmedCmd := strings.TrimSpace(initCommand)
+	if trimmedCmd != "" && !showCommand {
+		if argv, err := shlex.Split(trimmedCmd); err == nil && len(argv) > 0 && !strings.ContainsAny(trimmedCmd, "|&;<>()$`") {
+			if resolved, lookErr := exec.LookPath(argv[0]); lookErr == nil {
+				cmd = exec.Command(resolved, argv[1:]...)
+			} else {
+				cmd = exec.Command(shell, "-lc", "exec "+trimmedCmd)
+			}
+		} else {
+			cmd = exec.Command(shell, "-lc", trimmedCmd)
+		}
+	} else {
+		cmd = exec.Command(shell, "-l")
+	}
 	cmd.Dir = cwd
 	cmd.Stdin = slave
 	cmd.Stdout = slave
@@ -544,6 +572,10 @@ func (d *daemonServer) getOrCreateSession(sessionID, cwd, requestedTerm string, 
 		}
 	}()
 
+	if trimmedCmd != "" && showCommand {
+		_, _ = master.Write([]byte(trimmedCmd + "\n"))
+	}
+
 	return sess, nil
 }
 
@@ -566,7 +598,7 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_ = c.Close()
 
 	case "ensure":
-		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols)
+		_, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, hs.Command, hs.ShowCmd)
 		if err != nil {
 			resp, _ := json.Marshal(map[string]any{"alive": false, "error": err.Error()})
 			_, _ = c.Write(append(resp, '\n'))
@@ -622,8 +654,13 @@ func (d *daemonServer) handleConn(c net.Conn) {
 		_, _ = c.Write(append(resp, '\n'))
 		_ = c.Close()
 
+	case "shutdown":
+		_, _ = c.Write([]byte(`{"ok":true}` + "\n"))
+		_ = c.Close()
+		d.shutdown()
+
 	case "attach":
-		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols)
+		sess, err := d.getOrCreateSession(hs.SessionID, hs.Cwd, hs.Term, hs.Rows, hs.Cols, "", false)
 		if err != nil {
 			_ = c.Close()
 			return
@@ -870,7 +907,16 @@ func shouldKeepSessionAliveWithSnapshot(sessionID string, attached bool, panes [
 		termToTab[p.TerminalID] = p.TabID
 	}
 
-	for tabID, ts := range sf.Tabs {
+	for stateID, ts := range sf.Tabs {
+		if ts == nil {
+			continue
+		}
+		tabID := ts.TabID
+		if tabID == "" {
+			if parts := strings.SplitN(stateID, "::", 2); len(parts) > 0 {
+				tabID = parts[0]
+			}
+		}
 		sessions := map[string]bool{}
 		collectDrawerSessions(ts.Tree, sessions)
 		for _, s := range ts.TermToSession {

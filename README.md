@@ -2,9 +2,9 @@
 
 ![herdr-drawer demo](assets/demo.gif)
 
-A VS Code-style persistent, multi-pane bottom terminal drawer for [herdr](https://herdr.dev), scoped to the current tab.
+Persistent, multi-pane terminal drawers and configurable utility sidecars for [herdr](https://herdr.dev), scoped to the current tab.
 
-Press `Ctrl+/` from Neovim (or any pane) to open a bottom terminal drawer in your editor's current working directory. Split the drawer into multiple panes, resize them, close splits, and press `Ctrl+/` again from **either Neovim or the drawer terminal** to hide the drawer — **without zooming your editor pane or hiding sibling panes** (like an AI agent or side panel) beside it. Press `Ctrl+/` again to restore the exact same multi-pane split arrangement and running shell processes.
+Press `Ctrl+/` from Neovim (or any pane) to toggle a bottom terminal drawer in your editor's current working directory. Split the drawer into multiple panes, run commands, and press `Ctrl+/` again to hide the drawer — **without zooming your editor pane or disturbing sibling panes** (like a right-hand AI agent sidecar). You can also define named utility profiles (such as a full-height right-hand `cursor agent` or `opencode` sidecar on `Ctrl+Shift+/`) that coexist cleanly with your bottom drawer regardless of the order in which you open them.
 
 ---
 
@@ -15,15 +15,13 @@ Press `Ctrl+/` from Neovim (or any pane) to open a bottom terminal drawer in you
 
 ---
 
-## Installation
+## Quickstart
 
-### 1. Install the Plugin in `herdr`
+### 1. Install the Plugin
 
 ```bash
 herdr plugin install iancharters/herdr-drawer
 ```
-
-During installation, `herdr` runs the plugin's `[[build]]` step (`scripts/build.sh`) once to download the prebuilt `herdr-drawer` binary for your OS/architecture from GitHub Releases into the plugin's `bin/herdr-drawer` directory (falling back to `go build` if Go is installed and no release asset is found).
 
 Or from a local checkout:
 
@@ -33,19 +31,10 @@ cd ~/dev/herdr-plugins/herdr-drawer
 make link
 ```
 
-Verify the plugin actions are registered:
-
-```bash
-herdr plugin action list --plugin herdr-drawer
-```
-
 ### 2. Bind `Ctrl+/` in `~/.config/herdr/config.toml`
 
-Add the following to `~/.config/herdr/config.toml`:
-
 ```toml
-# Herdr Terminal Drawer
-
+# Toggle bottom terminal drawer
 [[keys.command]]
 key = "ctrl+/"
 type = "plugin_action"
@@ -53,7 +42,9 @@ command = "herdr-drawer.toggle"
 description = "toggle terminal drawer"
 ```
 
-*(Optional)* You can also bind dedicated shortcuts to split panes inside the drawer, or simply use your existing `herdr` split keybindings (`prefix+s`, `prefix+v`, etc.):
+Without any profile config file, `herdr-drawer` works out of the box with a persistent bottom drawer (`30%` height) anchored beneath your active pane.
+
+*(Optional)* Bind dedicated drawer split shortcuts, or simply use your standard `herdr` split keybindings (`prefix+v`, `prefix+s`, etc.) inside the drawer:
 
 ```toml
 [[keys.command]]
@@ -71,92 +62,156 @@ description = "split terminal drawer down"
 
 Reload `herdr`'s configuration (`prefix+shift+r`) after saving `config.toml`.
 
-### 3. Configure Neovim
+### 3. Configure Neovim *(Optional)*
 
-To ensure the drawer always opens in Neovim's active working directory (even when you change directories inside Neovim via `:cd`, `:lcd`, `:tcd`, or a file explorer plugin) and to provide `:HerdrDrawer*` commands and fallback `<C-/>` keymaps, run the interactive setup command:
+To keep the drawer synchronized with Neovim's active working directory (`:cd`, `:lcd`, `:tcd`) and install `:HerdrDrawer*` commands, run:
 
 ```bash
-# From inside herdr (opens an interactive setup popup):
+# Inside herdr (opens an interactive setup popup):
 herdr plugin action invoke herdr-drawer.setup
 
-# Or from a local checkout in your terminal:
+# Or from a local checkout:
 make setup
 ```
 
-You will be prompted for the destination path (defaulting to `~/.config/nvim/lua/plugins/herdr-drawer.lua` — press `Enter` to accept or type a custom path). It installs a small loader that locates `herdr-drawer`'s installed `plugin_root` in `~/.config/herdr/plugins.json` and loads `editor/nvim.lua` directly from the `herdr` plugin directory. Restart Neovim after running setup.
+Press `Enter` to accept the default path (`~/.config/nvim/lua/plugins/herdr-drawer.lua`) and restart Neovim.
+
+---
+
+## Configurable Utility Profiles & Starter Recipes
+
+You can define any number of named utility profiles in:
+
+```text
+~/.config/herdr/plugins/config/herdr-drawer/profiles.toml
+```
+
+See [`profiles.example.toml`](profiles.example.toml) for a ready-to-copy template.
+
+### Recipe 1: Neovim Bottom Drawer + Full-Height Cursor Agent Sidecar
+
+This setup gives you:
+- **`Ctrl+/`**: A multi-pane bottom terminal drawer (`30%` height) anchored directly beneath `nvim`.
+- **`Ctrl+Shift+/`**: A persistent `cursor agent` sidecar (`35%` width) spanning the full right side of the tab (`scope = "tab"`), launched directly without echoing `cursor agent` in the terminal.
+
+**`~/.config/herdr/plugins/config/herdr-drawer/profiles.toml`:**
+
+```toml
+default_profile = "default"
+
+[profiles.default]
+placement = "down"
+scope = "anchor"
+size_ratio = 0.30
+persist_on_hide = true
+anchor_policy = "app_in_tab_or_tab_scope"
+anchor_app_match = ["nvim", "vim"]
+
+[profiles.cursorRight]
+placement = "right"
+scope = "tab"
+size_ratio = 0.35
+persist_on_hide = true
+show_command_text = false
+command = "cursor agent"
+```
+
+**`~/.config/herdr/config.toml`:**
+
+```toml
+[[keys.command]]
+key = "ctrl+/"
+type = "plugin_action"
+command = "herdr-drawer.toggle"
+description = "toggle bottom terminal drawer"
+
+[[keys.command]]
+key = "ctrl+shift+/"
+type = "shell"
+command = "~/.config/herdr/plugins/iancharters/herdr-drawer/bin/herdr-drawer toggle --profile cursorRight"
+description = "toggle right-hand Cursor Agent sidecar"
+```
+
+*(If installed via `make link` from a local checkout, point `command` to your checkout's `bin/herdr-drawer` path.)*
+
+### Recipe 2: OpenCode / Claude Code Sidecar with `{{cwd}}` Interpolation
+
+Use `{{cwd}}` (or `${cwd}`) in `command` to pass the anchor pane's working directory to your tool on initial session creation:
+
+```toml
+[profiles.opencodeRight]
+placement = "right"
+scope = "tab"
+size_ratio = 0.35
+persist_on_hide = true
+show_command_text = false
+command = "opencode {{cwd}}"
+```
+
+### Recipe 3: Ephemeral Test / Task Runner (`persist_on_hide = false`)
+
+Set `persist_on_hide = false` and `show_command_text = true` for a drawer that runs a command visibly on open and terminates when hidden:
+
+```toml
+[profiles.testRunner]
+placement = "down"
+scope = "anchor"
+size_ratio = 0.25
+persist_on_hide = false
+show_command_text = true
+command = "go test -v ./..."
+```
+
+---
+
+## Profile Configuration Reference
+
+| Option | Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `placement` | `"down"`, `"up"`, `"left"`, `"right"` | `"down"` | Side of the anchor pane (or tab root) where the utility pane opens. |
+| `scope` | `"anchor"`, `"tab"` | `"anchor"` | `"anchor"` splits only the target anchor pane; `"tab"` splits the full tab root so the pane spans the entire side of the tab. |
+| `size_ratio` | `0.10` .. `0.90` | `0.30` | Fraction of the split occupied by the utility pane. |
+| `persist_on_hide` | `true`, `false` | `true` | Keep PTY sessions alive in the background daemon when hidden (`true`), or terminate on hide (`false`). |
+| `command` | string | `""` | Optional startup command run when a new session is created. Supports `{{cwd}}` and `${cwd}` placeholders. |
+| `show_command_text` | `true`, `false` | `false` | When `false`, runs `command` directly without echoing the command string or pre-filling prompts. When `true`, sends the command visibly to an interactive login shell. |
+| `anchor_policy` | `"generic_non_plugin"`, `"app_in_tab_or_tab_scope"` | `"generic_non_plugin"` | How `scope = "anchor"` picks its target pane. `"app_in_tab_or_tab_scope"` prefers a pane running an `anchor_app_match` process (e.g. `nvim`), anchors to a single non-plugin pane if only one exists, or falls back to spanning the non-plugin subtree if multiple shell panes exist. |
+| `anchor_app_match` | `[]string` | `["nvim", "vim"]` | Foreground process names matched when `anchor_policy = "app_in_tab_or_tab_scope"`. |
+
+### Cleanup Actions
+
+To close open utility panes and terminate background daemon sessions on demand:
+
+```bash
+# Clean up drawer/utility sessions in the current workspace only
+herdr plugin action invoke herdr-drawer.cleanup-workspace
+
+# Clean up all drawer/utility sessions across all workspaces and stop the daemon
+herdr plugin action invoke herdr-drawer.cleanup-all
+```
 
 ---
 
 ## How It Works
 
-### Why Not Pane Zoom or Popups?
+### Visual Layout (`default` Bottom Drawer + `cursorRight` Tab Sidecar)
 
-1. **Pane Zoom hides sibling panes**: In a typical layout with `Neovim` on the left and an `Agent` pane on the right, hiding a bottom split by zooming the `Neovim` pane expands `Neovim` across the entire tab — making the `Agent` pane disappear.
-2. **Popup / Overlay panes are single-pane and ephemeral**: Built-in popup overlays only support a single terminal pane (no inner horizontal/vertical splits) and terminate the process when closed.
-
-`herdr-drawer` solves both problems by manipulating only the drawer subtree in the tab's binary `TileLayout` tree over `herdr`'s Unix socket (`$HERDR_SOCKET_PATH`).
-
-### Visual Layout
-
-#### 1. Drawer Closed (Initial / Hidden State)
-Your editor and any side-by-side panes (such as an `Agent` pane) sit alongside each other cleanly:
-
-```text
-+------------------------------------------+------------------------+
-|                                          |                        |
-|                                          |                        |
-|                  Neovim                  |         Agent          |
-|                 (w1:p1)                  |        (w1:p2)         |
-|          cwd: ~/dev/my-project           |                        |
-|                                          |                        |
-|                                          |                        |
-+------------------------------------------+------------------------+
-```
-
-#### 2. Press `Ctrl+/` -> Drawer Opens Beneath Neovim
-A bottom terminal drawer opens directly beneath `Neovim` (default 30% height) in `Neovim`'s active working directory (`getcwd()`), while the `Agent` pane on the right remains untouched:
+Whether you open the bottom drawer (`Ctrl+/`) first or the right-hand sidecar (`Ctrl+Shift+/`) first, `herdr-drawer` converges to the same layout:
 
 ```text
 +------------------------------------------+------------------------+
 |                                          |                        |
 |                  Neovim                  |                        |
-|                 (w1:p1)                  |                        |
-|                                          |         Agent          |
-+------------------------------------------+        (w1:p2)         |
-| > zsh (~/dev/my-project)                 |                        |
-|   Drawer Pane 1 (term_A)                 |                        |
-+------------------------------------------+------------------------+
-```
-
-#### 3. Split & Arrange Multiple Panes Inside the Drawer
-Split panes inside the drawer using either standard `herdr` split keybindings or `herdr-drawer`'s split actions:
-
-```text
-+------------------------------------------+------------------------+
-|                                          |                        |
-|                  Neovim                  |                        |
-|                 (w1:p1)                  |                        |
-|                                          |         Agent          |
-+--------------------+---------------------+        (w1:p2)         |
-| > npm run dev      | > git status        |                        |
+|                 (w1:p1)                  |      Cursor Agent      |
+|                                          |    (cursorRight, 35%)  |
++--------------------+---------------------+      scope = "tab"     |
+| > ls               | > git status        |                        |
 |   Drawer 1 (term_A)|   Drawer 2 (term_B) |                        |
 +--------------------+---------------------+------------------------+
 ```
 
-#### 4. Press `Ctrl+/` Again (from Neovim or the Drawer) -> Drawer Hides
-Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the drawer's binary split tree (`Split(right, 0.5, sess_A, sess_B)` + drawer height ratio) and closes the drawer panes in `herdr` while keeping their underlying shells alive inside a single background multiplexer daemon (`herdr-drawer daemon`). `Neovim` reclaims its full height, `Agent` (`w1:p2`) stays visible, and **no extra workspace or tab ever appears in `herdr`'s workspace or tab bars**. Pressing `Ctrl+/` again recreates the split tree via `plugin.pane.open` and re-attaches each pane to its persistent PTY session in the daemon with full screen replay.
-
-### Single Multiplexer Daemon & Event-Driven Lifecycle (`events.subscribe`)
-
-- **Single Per-Server Daemon (`herdr-drawer daemon`)**: One lightweight background process per `herdr` server listens on `/tmp/herdr-drawer-<uid>/daemon.sock` and multiplexes all drawer PTY sessions (`map[session_id]*ptySession`) along with a `128 KB` screen replay ring buffer per pane.
-- **Zero-Polling Push Subscriptions (`events.subscribe`)**: The daemon holds a single persistent connection to `$HERDR_SOCKET_PATH` subscribed to `pane.created`, `pane.closed`, `tab.closed`, and `workspace.closed`:
-  - **Automatic Native Split Adoption**: When you split a drawer pane using standard `herdr` keybindings (`prefix+v`, `prefix+s`, `prefix+-`), `herdr` emits `pane_created`. The daemon immediately detects the new native split leaf inside the drawer subtree, allocates a persistent PTY session for it (inheriting the sibling drawer session's `cwd`), and swaps it in-place in the binary split tree so both split geometry (`direction` and `ratio`) and shell state survive hide/unhide.
-  - **Zero-CPU Idle & Instant Cleanup**: While idle, the daemon blocks on kernel socket reads (`kqueue` on macOS, `epoll` on Linux) with **0 timers and 0% CPU**. Closing a drawer pane, tab, or workspace reconciles orphaned PTYs immediately, and stopping `herdr` wakes the socket with `EOF` in `<1ms` to tear down all drawer shells.
-
-### Split-Tree Snapshot & Pre-Order Reconstruction
-
-- **Hiding**: `herdr-drawer` exports `DrawerSplit.second` as a binary tree of persistent `session_id`s (`sess_A`, `sess_B`) along with each split's `direction` and `ratio`, then closes the drawer panes in `herdr`. Removing those leaves collapses `DrawerSplit` back into `EditorPane` (`w1:p1`) without touching `AgentPane` (`w1:p2`) and without creating any stash workspace in `herdr`'s sidebar.
-- **Unhiding**: Traversing the saved binary tree `D` in **pre-order** via `plugin.pane.open` and `layout.set_split_ratio` reconstructs any arbitrary combination of nested horizontal and vertical splits with their exact ratios and re-attaches each pane (`herdr-drawer attach`) to the background multiplexer daemon (`herdr-drawer daemon`), replaying the ring buffer so output and running processes are preserved seamlessly.
+- **Order-Invariant Geometry**: Opening a `scope = "tab"` profile stages and reconstructs existing tab splits so the sidecar always wraps the outer tab root, while `scope = "anchor"` profiles split directly beneath your editor pane.
+- **Single Multiplexer Daemon (`herdr-drawer daemon`)**: One lightweight background process per `herdr` server multiplexes all profile PTY sessions (`map[session_id]*ptySession`) with a `128 KB` screen replay ring buffer per pane.
+- **Event-Driven Lifecycle (`events.subscribe`)**: Subscribes to `pane.created`, `pane.closed`, `tab.closed`, and `workspace.closed` over `$HERDR_SOCKET_PATH`. Native Herdr splits inside a drawer are automatically adopted into persistent sessions, and closing a tab or workspace immediately reaps orphaned PTYs with zero polling when idle.
 
 ---
 
@@ -165,7 +220,7 @@ Pressing `Ctrl+/` from **either** `Neovim` or any drawer pane snapshots the draw
 ```bash
 make build   # compile bin/herdr-drawer from source
 make setup   # interactively install the Neovim plugin loader
-make test    # run Go unit tests
+make test    # run Go unit and integration tests
 make vet     # run go vet
 make link    # build and link local checkout into herdr
 ```

@@ -1,8 +1,8 @@
 id = "herdr-drawer"
 name = "Herdr Terminal Drawer"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
-description = "VS Code-style persistent, multi-pane bottom terminal drawer scoped to each herdr tab"
+description = "Persistent, profile-driven utility panes (drawer/sidecar) scoped to each herdr tab"
 platforms = ["linux", "macos"]
 
 [[build]]
@@ -44,6 +44,18 @@ id = "setup"
 title = "Setup Neovim integration"
 contexts = ["global"]
 command = ["bin/herdr-drawer", "setup"]
+
+[[actions]]
+id = "cleanup-workspace"
+title = "Cleanup utility sessions in current workspace"
+contexts = ["global"]
+command = ["bin/herdr-drawer", "cleanup", "--scope", "workspace"]
+
+[[actions]]
+id = "cleanup-all"
+title = "Cleanup all utility sessions"
+contexts = ["global"]
+command = ["bin/herdr-drawer", "cleanup", "--scope", "all"]
 
 [[panes]]
 id = "drawer"
