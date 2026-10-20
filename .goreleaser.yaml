@@ -30,6 +30,7 @@ archives:
       - LICENSE
       - README.md
       - herdr-plugin.toml
+      - profiles.example.toml
       - editor/*
       - scripts/*
 
