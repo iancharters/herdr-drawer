@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,11 +15,14 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/google/shlex"
@@ -29,6 +33,8 @@ const (
 	frameResize byte = 0x02
 	maxRingSize      = 128 * 1024
 )
+
+var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 type winsize struct {
 	Row    uint16
@@ -51,6 +57,14 @@ func setWinsize(fd uintptr, rows, cols uint16) {
 	}
 	ws := winsize{Row: rows, Col: cols}
 	_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
+}
+
+func hasSubstantiveOutput(out []byte) bool {
+	if len(out) == 0 {
+		return false
+	}
+	cleaned := ansiEscapeRe.ReplaceAll(out, nil)
+	return strings.TrimSpace(string(cleaned)) != ""
 }
 
 type ringBuffer struct {
@@ -973,7 +987,7 @@ func runAttach(sessionID, cwd string) error {
 		if paneID == "" || agentLabel == "" {
 			return
 		}
-		args := []string{"pane", "report-agent", "--source", pluginID, "--agent", agentLabel, "--state", state}
+		args := []string{"pane", "report-agent", "--source", pluginID, "--agent", agentLabel, "--state", state, "--agent-session-id", sessionID}
 		if strings.TrimSpace(msg) != "" {
 			args = append(args, "--message", msg)
 		}
@@ -990,7 +1004,7 @@ func runAttach(sessionID, cwd string) error {
 		if paneID == "" || agentLabel == "" {
 			return
 		}
-		args := []string{"pane", "report-agent-session", "--source", pluginID, "--agent", agentLabel, "--session-start-source", "plugin", paneID}
+		args := []string{"pane", "report-agent-session", "--source", pluginID, "--agent", agentLabel, "--agent-session-id", sessionID, "--session-start-source", "plugin", paneID}
 		if resumeCommand != "" {
 			if resumeArgs, err := shlex.Split(resumeCommand); err == nil && len(resumeArgs) > 0 {
 				args = append(args, "--")
@@ -1006,7 +1020,47 @@ func runAttach(sessionID, cwd string) error {
 		_ = exec.Command("herdr", "pane", "release-agent", "--source", pluginID, "--agent", agentLabel, paneID).Run()
 	}
 	reportSession()
-	reportLifecycle("idle", "")
+	currentState := "idle"
+	reportLifecycle(currentState, "")
+	doneCh := make(chan struct{})
+	var stateMu sync.Mutex
+	var lastActivityUnix int64 = time.Now().UnixNano()
+	setState := func(next, msg string) {
+		if next == "" {
+			return
+		}
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if next == currentState {
+			return
+		}
+		currentState = next
+		reportLifecycle(next, msg)
+	}
+	touchActivity := func() {
+		atomic.StoreInt64(&lastActivityUnix, time.Now().UnixNano())
+	}
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-doneCh:
+				return
+			case <-t.C:
+				stateMu.Lock()
+				st := currentState
+				stateMu.Unlock()
+				if st != "working" {
+					continue
+				}
+				last := time.Unix(0, atomic.LoadInt64(&lastActivityUnix))
+				if time.Since(last) >= 4*time.Second {
+					setState("idle", "")
+				}
+			}
+		}
+	}()
 	defer releaseLifecycle()
 
 	conn, err := net.DialTimeout("unix", daemonSocketPath(), 2*time.Second)
@@ -1052,7 +1106,6 @@ func runAttach(sessionID, cwd string) error {
 	signal.Notify(termCh, syscall.SIGHUP, syscall.SIGTERM)
 	defer signal.Stop(termCh)
 
-	doneCh := make(chan struct{})
 	go func() {
 		for {
 			select {
@@ -1083,6 +1136,10 @@ func runAttach(sessionID, cwd string) error {
 					_ = conn.Close()
 					return
 				}
+				if bytes.Contains(buf[:n], []byte{'\n'}) {
+					touchActivity()
+					setState("working", "")
+				}
 			}
 			if err != nil {
 				_ = conn.Close()
@@ -1091,7 +1148,47 @@ func runAttach(sessionID, cwd string) error {
 		}
 	}()
 
-	_, _ = io.Copy(os.Stdout, conn)
+	looksBlocked := func(s string) bool {
+		ls := strings.ToLower(s)
+		return strings.Contains(ls, "needs your input") ||
+			strings.Contains(ls, "need your input") ||
+			strings.Contains(ls, "requires your input") ||
+			strings.Contains(ls, "requires approval") ||
+			strings.Contains(ls, "waiting for your response") ||
+			strings.Contains(ls, "press enter to continue")
+	}
+	looksIdle := func(s string) bool {
+		return strings.Contains(s, "❯ ") || strings.Contains(s, "-> cursor agent")
+	}
+
+	chunk := make([]byte, 4096)
+	for {
+		n, err := conn.Read(chunk)
+		if n > 0 {
+			out := chunk[:n]
+			_, _ = os.Stdout.Write(out)
+			substantive := hasSubstantiveOutput(out)
+			if substantive {
+				touchActivity()
+			}
+			if utf8.Valid(out) {
+				text := string(out)
+				switch {
+				case looksBlocked(text):
+					setState("blocked", "")
+				case looksIdle(text):
+					setState("idle", "")
+				default:
+					if substantive {
+						setState("working", "")
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
 	reportLifecycle("unknown", "")
 	close(doneCh)
 	return nil
