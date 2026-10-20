@@ -87,6 +87,8 @@ type DrawerNode struct {
 	Type      string      `json:"type"` // "leaf" or "split"
 	SessionID string      `json:"session_id,omitempty"`
 	Cwd       string      `json:"cwd,omitempty"`
+	Command   string      `json:"command,omitempty"`
+	Agent     string      `json:"agent,omitempty"`
 	Direction string      `json:"direction,omitempty"`
 	Ratio     float64     `json:"ratio,omitempty"`
 	First     *DrawerNode `json:"first,omitempty"`
@@ -293,6 +295,10 @@ func (c *RPCClient) GetProcessInfo(paneID string) (*ProcessInfo, error) {
 }
 
 func (c *RPCClient) OpenPluginSplitPane(targetPaneID, direction, cwd, sessionID string, focus bool) (*PaneInfo, error) {
+	return c.OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd, sessionID, "", "", focus)
+}
+
+func (c *RPCClient) OpenPluginSplitPaneWithMetadata(targetPaneID, direction, cwd, sessionID, agentLabel, resumeCommand string, focus bool) (*PaneInfo, error) {
 	params := map[string]interface{}{
 		"plugin_id":      pluginID,
 		"entrypoint":     drawerEntrypointID,
@@ -301,8 +307,10 @@ func (c *RPCClient) OpenPluginSplitPane(targetPaneID, direction, cwd, sessionID 
 		"target_pane_id": targetPaneID,
 		"focus":          focus,
 		"env": map[string]string{
-			"HERDR_DRAWER_SESSION_ID": sessionID,
-			"HERDR_DRAWER_CWD":        cwd,
+			"HERDR_DRAWER_SESSION_ID":     sessionID,
+			"HERDR_DRAWER_CWD":            cwd,
+			"HERDR_DRAWER_AGENT_LABEL":    agentLabel,
+			"HERDR_DRAWER_RESUME_COMMAND": resumeCommand,
 		},
 	}
 	if cwd != "" {
@@ -725,6 +733,62 @@ func layoutToDrawerTree(node *LayoutNode, paneByID map[string]PaneInfo, termToSe
 	}
 }
 
+func collectSessionMetadata(node *DrawerNode, out map[string]DrawerNode) {
+	if node == nil {
+		return
+	}
+	if node.Type == "leaf" {
+		if node.SessionID != "" {
+			out[node.SessionID] = *node
+		}
+		return
+	}
+	collectSessionMetadata(node.First, out)
+	collectSessionMetadata(node.Second, out)
+}
+
+func hydrateDrawerMetadata(node *DrawerNode, meta map[string]DrawerNode) {
+	if node == nil || len(meta) == 0 {
+		return
+	}
+	if node.Type == "leaf" {
+		if m, ok := meta[node.SessionID]; ok {
+			if node.Command == "" {
+				node.Command = m.Command
+			}
+			if node.Agent == "" {
+				node.Agent = m.Agent
+			}
+		}
+		return
+	}
+	hydrateDrawerMetadata(node.First, meta)
+	hydrateDrawerMetadata(node.Second, meta)
+}
+
+func inferAgentLabel(command string) string {
+	cmd := strings.TrimSpace(command)
+	if cmd == "" {
+		return ""
+	}
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return ""
+	}
+	switch strings.ToLower(fields[0]) {
+	case "cursor":
+		return "cursor"
+	case "codex":
+		return "codex"
+	case "claude":
+		return "claude"
+	case "gemini":
+		return "gemini"
+	default:
+		return ""
+	}
+}
+
 func collectLayoutPaneIDs(node *LayoutNode) []string {
 	if node == nil {
 		return nil
@@ -777,6 +841,8 @@ func pruneDrawerTree(node *DrawerNode, isAlive func(string) bool) *DrawerNode {
 			Type:      "leaf",
 			SessionID: node.SessionID,
 			Cwd:       node.Cwd,
+			Command:   node.Command,
+			Agent:     node.Agent,
 		}
 	}
 	first := pruneDrawerTree(node.First, isAlive)
@@ -952,7 +1018,7 @@ func adoptNativeDrawerSplits(tabID string) error {
 
 				newSessID := newSessionID()
 				_ = ensureSessionHost(newSessID, cwd, 24, 80)
-				newPane, err := openDrawerPaneWithRatio(client, tabID, p.PaneID, "right", 0.5, newSessID, cwd, "", false, p.Focused)
+				newPane, err := openDrawerPaneWithRatio(client, tabID, p.PaneID, "right", 0.5, newSessID, cwd, "", "", "", false, p.Focused)
 				if err != nil {
 					killSession(newSessID)
 					continue
@@ -1066,10 +1132,10 @@ func reconstructLayoutSubtree(client *RPCClient, tabID string, node *LayoutNode,
 	return reconstructLayoutSubtree(client, tabID, node.Second, secondRep)
 }
 
-func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, placement string, ratio float64, sessionID, cwd, command string, showCommand bool, focus bool) (*PaneInfo, error) {
-	_ = ensureSessionHostWithCommand(sessionID, cwd, 24, 80, command, showCommand)
+func openDrawerPaneWithRatio(client *RPCClient, tabID, targetPaneID, placement string, ratio float64, sessionID, cwd, startupCommand, resumeCommand, agentLabel string, showCommand bool, focus bool) (*PaneInfo, error) {
+	_ = ensureSessionHostWithCommand(sessionID, cwd, 24, 80, startupCommand, showCommand)
 	spec := normalizePlacement(placement)
-	pane, err := client.OpenPluginSplitPane(targetPaneID, spec.layoutDirection, cwd, sessionID, focus)
+	pane, err := client.OpenPluginSplitPaneWithMetadata(targetPaneID, spec.layoutDirection, cwd, sessionID, agentLabel, resumeCommand, focus)
 	if err != nil {
 		return nil, err
 	}
@@ -1112,7 +1178,7 @@ func reconstructSplitsPreOrder(client *RPCClient, tabID string, node *DrawerNode
 	if dir != "right" && dir != "down" {
 		dir = "right"
 	}
-	newPane, err := openDrawerPaneWithRatio(client, tabID, targetPane.PaneID, dir, ratio, rightLeaf.SessionID, rightLeaf.Cwd, "", false, false)
+	newPane, err := openDrawerPaneWithRatio(client, tabID, targetPane.PaneID, dir, ratio, rightLeaf.SessionID, rightLeaf.Cwd, "", rightLeaf.Command, rightLeaf.Agent, false, false)
 	if err != nil {
 		return err
 	}
@@ -1334,6 +1400,9 @@ func hideDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 	if tree == nil {
 		return errors.New("drawer split had no valid panes")
 	}
+	prevMeta := map[string]DrawerNode{}
+	collectSessionMetadata(ts.Tree, prevMeta)
+	hydrateDrawerMetadata(tree, prevMeta)
 
 	knownSessions := map[string]bool{}
 	collectDrawerSessions(tree, knownSessions)
@@ -1456,7 +1525,8 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 		if command != "" && !profile.ShowCommand {
 			startupCommand = command
 		}
-		newPane, err := openDrawerPaneWithRatio(client, ts.TabID, targetAnchorPaneID, profile.Placement, splitRatioForPlacement(profile.SizeRatio, profile.Placement), sessionID, cwd, startupCommand, profile.ShowCommand, savedTabTree == nil)
+		agentLabel := inferAgentLabel(command)
+		newPane, err := openDrawerPaneWithRatio(client, ts.TabID, targetAnchorPaneID, profile.Placement, splitRatioForPlacement(profile.SizeRatio, profile.Placement), sessionID, cwd, startupCommand, command, agentLabel, profile.ShowCommand, savedTabTree == nil)
 		if err != nil {
 			if savedTabTree != nil {
 				_ = reconstructLayoutSubtree(client, ts.TabID, savedTabTree, keptPaneID)
@@ -1481,6 +1551,8 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 			Type:      "leaf",
 			SessionID: sessionID,
 			Cwd:       cwd,
+			Command:   command,
+			Agent:     agentLabel,
 		}
 		ts.TermToSession[newPane.TerminalID] = sessionID
 		ts.FocusedSessionID = sessionID
@@ -1499,7 +1571,7 @@ func showDrawer(client *RPCClient, ts *TabDrawerState, profile EffectiveProfile,
 		rootLeaf.Cwd = resolveAnchorCwd(client, anchorPane, explicitCwd)
 	}
 
-	rootPane, err := openDrawerPaneWithRatio(client, ts.TabID, targetAnchorPaneID, profile.Placement, splitRatioForPlacement(profile.SizeRatio, profile.Placement), rootLeaf.SessionID, rootLeaf.Cwd, "", false, false)
+	rootPane, err := openDrawerPaneWithRatio(client, ts.TabID, targetAnchorPaneID, profile.Placement, splitRatioForPlacement(profile.SizeRatio, profile.Placement), rootLeaf.SessionID, rootLeaf.Cwd, "", rootLeaf.Command, rootLeaf.Agent, false, false)
 	if err != nil {
 		if savedTabTree != nil {
 			_ = reconstructLayoutSubtree(client, ts.TabID, savedTabTree, keptPaneID)
@@ -1840,7 +1912,7 @@ func runAction(action, explicitPaneID, explicitCwd, splitDir, profileName, clean
 				splitDir = "right"
 			}
 			newSessID := newSessionID()
-			newPane, err := openDrawerPaneWithRatio(client, tabID, targetSplitPane.PaneID, splitDir, 0.5, newSessID, cwd, "", false, true)
+			newPane, err := openDrawerPaneWithRatio(client, tabID, targetSplitPane.PaneID, splitDir, 0.5, newSessID, cwd, "", "", "", false, true)
 			if err != nil {
 				return err
 			}

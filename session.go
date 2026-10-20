@@ -957,14 +957,61 @@ func runAttach(sessionID, cwd string) error {
 	if sessionID == "" {
 		return errors.New("HERDR_DRAWER_SESSION_ID is not set")
 	}
+	paneID := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
+	agentLabel := strings.TrimSpace(os.Getenv("HERDR_DRAWER_AGENT_LABEL"))
+	if agentLabel == "" {
+		agentLabel = inferAgentLabel(os.Getenv("HERDR_DRAWER_RESUME_COMMAND"))
+	}
+	resumeCommand := strings.TrimSpace(os.Getenv("HERDR_DRAWER_RESUME_COMMAND"))
 
 	rows, cols := getWinsize(os.Stdin.Fd())
 	if err := ensureDaemon(); err != nil {
 		return err
 	}
 
+	reportLifecycle := func(state, msg string) {
+		if paneID == "" || agentLabel == "" {
+			return
+		}
+		args := []string{"pane", "report-agent", "--source", pluginID, "--agent", agentLabel, "--state", state}
+		if strings.TrimSpace(msg) != "" {
+			args = append(args, "--message", msg)
+		}
+		args = append(args, paneID)
+		if resumeCommand != "" {
+			if resumeArgs, err := shlex.Split(resumeCommand); err == nil && len(resumeArgs) > 0 {
+				args = append(args, "--")
+				args = append(args, resumeArgs...)
+			}
+		}
+		_ = exec.Command("herdr", args...).Run()
+	}
+	reportSession := func() {
+		if paneID == "" || agentLabel == "" {
+			return
+		}
+		args := []string{"pane", "report-agent-session", "--source", pluginID, "--agent", agentLabel, "--session-start-source", "plugin", paneID}
+		if resumeCommand != "" {
+			if resumeArgs, err := shlex.Split(resumeCommand); err == nil && len(resumeArgs) > 0 {
+				args = append(args, "--")
+				args = append(args, resumeArgs...)
+			}
+		}
+		_ = exec.Command("herdr", args...).Run()
+	}
+	releaseLifecycle := func() {
+		if paneID == "" || agentLabel == "" {
+			return
+		}
+		_ = exec.Command("herdr", "pane", "release-agent", "--source", pluginID, "--agent", agentLabel, paneID).Run()
+	}
+	reportSession()
+	reportLifecycle("idle", "")
+	defer releaseLifecycle()
+
 	conn, err := net.DialTimeout("unix", daemonSocketPath(), 2*time.Second)
 	if err != nil {
+		reportLifecycle("unknown", err.Error())
 		return err
 	}
 	defer conn.Close()
@@ -981,6 +1028,7 @@ func runAttach(sessionID, cwd string) error {
 		Cols:      cols,
 	})
 	if _, err := conn.Write(append(hsBytes, '\n')); err != nil {
+		reportLifecycle("unknown", err.Error())
 		return err
 	}
 
@@ -1044,6 +1092,7 @@ func runAttach(sessionID, cwd string) error {
 	}()
 
 	_, _ = io.Copy(os.Stdout, conn)
+	reportLifecycle("unknown", "")
 	close(doneCh)
 	return nil
 }
