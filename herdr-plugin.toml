@@ -1,6 +1,6 @@
 id = "herdr-drawer"
 name = "Herdr Terminal Drawer"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.7.0"
 description = "Persistent, profile-driven utility panes (drawer/sidecar) scoped to each herdr tab"
 platforms = ["linux", "macos"]

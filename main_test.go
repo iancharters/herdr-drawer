@@ -26,8 +26,14 @@ type mockHerdrServer struct {
 	paneOrder   []string
 	tabs        map[string]*LayoutNode
 	processes   map[string][]ForegroundProcess
-	sentText    map[string][]string
-	popupCalls  int
+	sentText           map[string][]string
+	popupCalls         int
+	agentHolders       map[string]string
+	agentReportEvents  []string
+	agentSessionEvents []string
+	explainState       string
+	explainReason      string
+	explainSkipUpdate  bool
 }
 
 func newMockHerdrServer(t *testing.T) *mockHerdrServer {
@@ -39,14 +45,16 @@ func newMockHerdrServer(t *testing.T) *mockHerdrServer {
 		t.Fatalf("listen mock herdr: %v", err)
 	}
 	s := &mockHerdrServer{
-		sockPath:    sockPath,
-		ln:          ln,
-		nextPaneNum: 1,
-		nextTabNum:  1,
-		panes:       make(map[string]*PaneInfo),
-		tabs:        make(map[string]*LayoutNode),
-		processes:   make(map[string][]ForegroundProcess),
-		sentText:    make(map[string][]string),
+		sockPath:     sockPath,
+		ln:           ln,
+		nextPaneNum:  1,
+		nextTabNum:   1,
+		panes:        make(map[string]*PaneInfo),
+		tabs:         make(map[string]*LayoutNode),
+		processes:    make(map[string][]ForegroundProcess),
+		sentText:     make(map[string][]string),
+		agentHolders: make(map[string]string),
+		explainState: "idle",
 	}
 	go s.serve()
 	t.Cleanup(func() {
@@ -505,6 +513,55 @@ func (s *mockHerdrServer) handleConn(conn net.Conn) {
 		_ = json.Unmarshal(req.Params, &params)
 		s.sentText[params.PaneID] = append(s.sentText[params.PaneID], params.Text)
 		replyOK(map[string]any{})
+
+	case "pane.report_agent":
+		var params struct {
+			PaneID  string `json:"pane_id"`
+			Agent   string `json:"agent"`
+			State   string `json:"state"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(req.Params, &params)
+		if params.State == "unknown" {
+			delete(s.agentHolders, params.PaneID)
+		} else {
+			s.agentHolders[params.PaneID] = params.Agent
+		}
+		s.agentReportEvents = append(s.agentReportEvents, fmt.Sprintf("%s:%s:%s:%s", params.PaneID, params.Agent, params.State, params.Message))
+		replyOK(map[string]any{})
+
+	case "pane.report_agent_session":
+		var params struct {
+			PaneID     string   `json:"pane_id"`
+			Agent      string   `json:"agent"`
+			SessionID  string   `json:"agent_session_id"`
+			ResumeArgv []string `json:"resume_argv"`
+		}
+		_ = json.Unmarshal(req.Params, &params)
+		if len(params.ResumeArgv) > 0 && s.agentHolders[params.PaneID] != params.Agent {
+			replyErr("resume_not_accepted", "resume_argv requires the reporter to hold the pane; report its state with pane.report_agent first")
+			return
+		}
+		s.agentSessionEvents = append(s.agentSessionEvents, fmt.Sprintf("%s:%s:%s:%s", params.PaneID, params.Agent, params.SessionID, strings.Join(params.ResumeArgv, " ")))
+		replyOK(map[string]any{})
+
+	case "agent.explain":
+		var params struct {
+			Target string `json:"target"`
+		}
+		_ = json.Unmarshal(req.Params, &params)
+		replyOK(map[string]any{
+			"pane": map[string]any{
+				"pane_id":      params.Target,
+				"agent_kind":   s.agentHolders[params.Target],
+				"agent_status": s.explainState,
+			},
+			"explain": map[string]any{
+				"state":             s.explainState,
+				"reason":            s.explainReason,
+				"skip_state_update": s.explainSkipUpdate,
+			},
+		})
 
 	default:
 		replyOK(map[string]any{})
@@ -1558,5 +1615,102 @@ func TestDaemonWatchdogReconcilePreservesHiddenSession(t *testing.T) {
 		t.Fatalf("expected hidden drawer session %s to survive 350ms watchdog reconciliation", sessID)
 	}
 }
+
+func TestWatchDrawerAgentStatusAndOrdering(t *testing.T) {
+	srv := newMockHerdrServer(t)
+	t.Setenv("HERDR_SOCKET_PATH", srv.sockPath)
+
+	outputSignal := make(chan struct{}, 1)
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		watchDrawerAgentStatus("w4:p5F", "cursor", "sess-123", "/usr/local/bin/cursor-agent --resume abc", outputSignal, stopCh)
+	}()
+
+	waitForReports := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			srv.mu.Lock()
+			got := len(srv.agentReportEvents)
+			srv.mu.Unlock()
+			if got >= want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		t.Fatalf("timed out waiting for %d agent reports, got %v", want, srv.agentReportEvents)
+	}
+
+	waitForReports(1)
+	time.Sleep(30 * time.Millisecond)
+	srv.mu.Lock()
+	if len(srv.agentSessionEvents) != 1 || srv.agentSessionEvents[0] != "w4:p5F:cursor:sess-123:cursor-agent --resume abc" {
+		srv.mu.Unlock()
+		t.Fatalf("expected pane.report_agent_session to succeed after pane.report_agent, got %v", srv.agentSessionEvents)
+	}
+	srv.mu.Unlock()
+
+	// Output while explain state is still "idle" (e.g. typing in prompt box) must NOT flip status to working.
+	select {
+	case outputSignal <- struct{}{}:
+	default:
+	}
+	time.Sleep(220 * time.Millisecond)
+	srv.mu.Lock()
+	if len(srv.agentReportEvents) != 1 {
+		srv.mu.Unlock()
+		t.Fatalf("expected typing output in idle state to not trigger working transition, got %v", srv.agentReportEvents)
+	}
+	srv.explainState = "working"
+	srv.explainReason = "stop_hint_working"
+	srv.mu.Unlock()
+
+	select {
+	case outputSignal <- struct{}{}:
+	default:
+	}
+	waitForReports(2)
+
+	srv.mu.Lock()
+	srv.explainState = "blocked"
+	srv.explainReason = "approval_prompt"
+	srv.mu.Unlock()
+	select {
+	case outputSignal <- struct{}{}:
+	default:
+	}
+	waitForReports(3)
+
+	srv.mu.Lock()
+	srv.explainState = "idle"
+	srv.explainReason = "prompt_ready"
+	srv.mu.Unlock()
+	select {
+	case outputSignal <- struct{}{}:
+	default:
+	}
+	waitForReports(4)
+
+	close(stopCh)
+	<-doneCh
+
+	srv.mu.Lock()
+	got := append([]string(nil), srv.agentReportEvents...)
+	srv.mu.Unlock()
+	want := []string{
+		"w4:p5F:cursor:idle:",
+		"w4:p5F:cursor:working:stop_hint_working",
+		"w4:p5F:cursor:blocked:approval_prompt",
+		"w4:p5F:cursor:idle:prompt_ready",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected agent report events:\ngot:  %v\nwant: %v", got, want)
+	}
+}
+
 
 
