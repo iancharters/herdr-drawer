@@ -814,6 +814,29 @@ func TestRingBuffer(t *testing.T) {
 	}
 }
 
+func TestRingBufferPreservesEvictedTerminalModes(t *testing.T) {
+	var r ringBuffer
+	r.Write([]byte("\x1b[>1u\x1b[?2004h\x1b[?1004h\x1b[?25l"))
+
+	filler := bytes.Repeat([]byte("A"), maxRingSize+512)
+	r.Write(filler)
+
+	snap := r.Snapshot()
+	wantPrefix := "\x1b[?25l\x1b[?1004h\x1b[?2004h\x1b[>1u"
+	if !strings.HasPrefix(string(snap), wantPrefix) {
+		t.Fatalf("expected snapshot to start with restored modes %q, got prefix %q", wantPrefix, string(snap[:min(len(snap), 64)]))
+	}
+
+	// If the application later exits and disables those modes, once evicted they must no longer be emitted.
+	r.Write([]byte("\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?25h"))
+	r.Write(filler)
+
+	snapAfterExit := r.Snapshot()
+	if strings.Contains(string(snapAfterExit), "\x1b[>1u") || strings.Contains(string(snapAfterExit), "\x1b[?2004h") {
+		t.Fatalf("expected disabled modes to be cleared after eviction, got prefix %q", string(snapAfterExit[:min(len(snapAfterExit), 64)]))
+	}
+}
+
 func TestSanitizeShellEnv(t *testing.T) {
 	t.Setenv("TERM", "dumb")
 	t.Setenv("NO_COLOR", "1")
