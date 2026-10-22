@@ -25,10 +25,285 @@ import (
 )
 
 const (
-	frameData   byte = 0x01
-	frameResize byte = 0x02
-	maxRingSize      = 128 * 1024
+	frameData      byte = 0x01
+	frameResize    byte = 0x02
+	maxRingSize         = 128 * 1024
+	maxCSILookback      = 64
+	maxKittyStack       = 16
 )
+
+const (
+	escNone = iota
+	escSeen
+	escCSI
+	escCSIInterm
+)
+
+type terminalModeTracker struct {
+	altScreen            bool
+	appCursor            bool
+	appKeypad            bool
+	cursorHidden         bool
+	focusReporting       bool
+	mouseMode            int
+	mouseEncoding        int
+	mouseAltScroll       bool
+	bracketedPaste       bool
+	colorSchemeReporting bool
+	modifyOtherKeys      int
+	kittyStack           []int
+}
+
+func (m *terminalModeTracker) reset() {
+	*m = terminalModeTracker{}
+}
+
+func parseCSIParamInt(s string, defaultVal int) int {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultVal
+	}
+	return v
+}
+
+func (m *terminalModeTracker) applyCSI(prefix, interm byte, params string, final byte) {
+	if prefix == 0 && interm == '!' && final == 'p' {
+		m.reset()
+		return
+	}
+	if interm != 0 {
+		return
+	}
+
+	switch {
+	case prefix == '?' && (final == 'h' || final == 'l'):
+		set := final == 'h'
+		for _, part := range strings.Split(params, ";") {
+			mode := parseCSIParamInt(part, -1)
+			switch mode {
+			case 1:
+				m.appCursor = set
+			case 9, 1000, 1002, 1003:
+				if set {
+					m.mouseMode = mode
+				} else if m.mouseMode == mode {
+					m.mouseMode = 0
+				}
+			case 25:
+				m.cursorHidden = !set
+			case 47, 1047, 1049:
+				m.altScreen = set
+			case 1004:
+				m.focusReporting = set
+			case 1005, 1006, 1016:
+				if set {
+					m.mouseEncoding = mode
+				} else if m.mouseEncoding == mode {
+					m.mouseEncoding = 0
+				}
+			case 1007:
+				m.mouseAltScroll = set
+			case 2004:
+				m.bracketedPaste = set
+			case 2031:
+				m.colorSchemeReporting = set
+			}
+		}
+
+	case final == 'u':
+		parts := strings.Split(params, ";")
+		switch prefix {
+		case '>':
+			flags := parseCSIParamInt(parts[0], 0)
+			if flags < 0 {
+				flags = 0
+			}
+			if len(m.kittyStack) >= maxKittyStack {
+				m.kittyStack = append([]int(nil), m.kittyStack[1:]...)
+			}
+			m.kittyStack = append(m.kittyStack, flags)
+		case '<':
+			count := parseCSIParamInt(parts[0], 1)
+			if count <= 0 {
+				count = 1
+			}
+			if count >= len(m.kittyStack) {
+				m.kittyStack = nil
+			} else {
+				m.kittyStack = m.kittyStack[:len(m.kittyStack)-count]
+			}
+		case '=':
+			flags := parseCSIParamInt(parts[0], 0)
+			if flags < 0 {
+				flags = 0
+			}
+			mode := 1
+			if len(parts) > 1 {
+				mode = parseCSIParamInt(parts[1], 1)
+			}
+			cur := 0
+			if len(m.kittyStack) > 0 {
+				cur = m.kittyStack[len(m.kittyStack)-1]
+			}
+			switch mode {
+			case 1:
+				cur = flags
+			case 2:
+				cur |= flags
+			case 3:
+				cur &^= flags
+			}
+			if len(m.kittyStack) == 0 {
+				if cur != 0 {
+					m.kittyStack = []int{cur}
+				}
+			} else {
+				m.kittyStack[len(m.kittyStack)-1] = cur
+			}
+		}
+
+	case prefix == '>' && final == 'm':
+		parts := strings.Split(params, ";")
+		if parseCSIParamInt(parts[0], -1) == 4 {
+			level := 0
+			if len(parts) > 1 {
+				level = parseCSIParamInt(parts[1], 0)
+			}
+			if level >= 0 && level <= 2 {
+				m.modifyOtherKeys = level
+			}
+		}
+	}
+}
+
+func (m *terminalModeTracker) consumeEvicted(data []byte) int {
+	state := escNone
+	escStart := 0
+	var prefix byte
+	var interm byte
+	var params [48]byte
+	paramLen := 0
+
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if b == 0x1b {
+			state = escSeen
+			escStart = i
+			prefix = 0
+			interm = 0
+			paramLen = 0
+			continue
+		}
+		if state == escNone {
+			continue
+		}
+		if i-escStart > maxCSILookback {
+			state = escNone
+			continue
+		}
+		switch state {
+		case escSeen:
+			switch b {
+			case '[':
+				state = escCSI
+			case '=':
+				m.appKeypad = true
+				state = escNone
+			case '>':
+				m.appKeypad = false
+				state = escNone
+			case 'c':
+				m.reset()
+				state = escNone
+			default:
+				state = escNone
+			}
+		case escCSI:
+			switch {
+			case paramLen == 0 && prefix == 0 && (b == '<' || b == '=' || b == '>' || b == '?'):
+				prefix = b
+			case (b >= '0' && b <= '9') || b == ';' || b == ':':
+				if paramLen < len(params) {
+					params[paramLen] = b
+					paramLen++
+				}
+			case b >= 0x20 && b <= 0x2f:
+				interm = b
+				state = escCSIInterm
+			case b >= 0x40 && b <= 0x7e:
+				m.applyCSI(prefix, interm, string(params[:paramLen]), b)
+				state = escNone
+			default:
+				state = escNone
+			}
+		case escCSIInterm:
+			switch {
+			case b >= 0x20 && b <= 0x2f:
+				interm = b
+			case b >= 0x40 && b <= 0x7e:
+				m.applyCSI(prefix, interm, string(params[:paramLen]), b)
+				state = escNone
+			default:
+				state = escNone
+			}
+		}
+	}
+
+	if state != escNone && len(data)-escStart <= maxCSILookback {
+		return escStart
+	}
+	return len(data)
+}
+
+func (m *terminalModeTracker) Bytes() []byte {
+	var b strings.Builder
+	if m.altScreen {
+		b.WriteString("\x1b[?1049h")
+	}
+	if m.appCursor {
+		b.WriteString("\x1b[?1h")
+	}
+	if m.appKeypad {
+		b.WriteString("\x1b=")
+	}
+	if m.cursorHidden {
+		b.WriteString("\x1b[?25l")
+	}
+	if m.focusReporting {
+		b.WriteString("\x1b[?1004h")
+	}
+	if m.mouseMode != 0 {
+		fmt.Fprintf(&b, "\x1b[?%dh", m.mouseMode)
+	}
+	if m.mouseEncoding != 0 {
+		fmt.Fprintf(&b, "\x1b[?%dh", m.mouseEncoding)
+	}
+	if m.mouseAltScroll {
+		b.WriteString("\x1b[?1007h")
+	}
+	if m.bracketedPaste {
+		b.WriteString("\x1b[?2004h")
+	}
+	if m.colorSchemeReporting {
+		b.WriteString("\x1b[?2031h")
+	}
+	if m.modifyOtherKeys > 0 {
+		fmt.Fprintf(&b, "\x1b[>4;%dm", m.modifyOtherKeys)
+	}
+	for _, flags := range m.kittyStack {
+		fmt.Fprintf(&b, "\x1b[>%du", flags)
+	}
+	if b.Len() == 0 {
+		return nil
+	}
+	return []byte(b.String())
+}
 
 type winsize struct {
 	Row    uint16
@@ -70,8 +345,9 @@ func parseResumeArgv(resumeCommand string) []string {
 }
 
 type ringBuffer struct {
-	mu  sync.Mutex
-	buf []byte
+	mu           sync.Mutex
+	buf          []byte
+	evictedModes terminalModeTracker
 }
 
 func (r *ringBuffer) Write(p []byte) {
@@ -79,15 +355,21 @@ func (r *ringBuffer) Write(p []byte) {
 	defer r.mu.Unlock()
 	r.buf = append(r.buf, p...)
 	if len(r.buf) > maxRingSize {
-		r.buf = append([]byte(nil), r.buf[len(r.buf)-maxRingSize:]...)
+		rawCut := len(r.buf) - maxRingSize
+		cut := r.evictedModes.consumeEvicted(r.buf[:rawCut])
+		if cut > 0 {
+			r.buf = append([]byte(nil), r.buf[cut:]...)
+		}
 	}
 }
 
 func (r *ringBuffer) Snapshot() []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]byte, len(r.buf))
-	copy(out, r.buf)
+	prefix := r.evictedModes.Bytes()
+	out := make([]byte, len(prefix)+len(r.buf))
+	copy(out, prefix)
+	copy(out[len(prefix):], r.buf)
 	return out
 }
 
